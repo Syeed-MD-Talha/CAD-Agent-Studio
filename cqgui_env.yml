@@ -1,0 +1,13 @@
+name: cq-occ-conda-test-py3
+channels:
+  - conda-forge
+dependencies:
+  - pyqt=5
+  - pyqtgraph
+  - python=3.10
+  - qtawesome=1.4.0
+  - path
+  - logbook
+  - requests
+  - build123d
+  - qtconsole >=5.5.1,<5.7.0

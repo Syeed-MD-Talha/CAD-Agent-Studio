@@ -1,0 +1,107 @@
+# Credentials and local configuration (only the blank template is publishable)
+.env
+.env.*
+!.env.example
+.envrc
+.aws/
+.azure/
+.secrets/
+secrets/
+credentials.json
+service-account*.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+id_rsa*
+id_ed25519*
+
+# Python bytecode and native build outputs
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Packaging and installers
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+*.egg-info/
+*.egg
+.installed.cfg
+MANIFEST
+*.manifest
+pip-log.txt
+pip-delete-this-directory.txt
+/out/
+/conda/linux-64/
+/conda/noarch/
+/conda/osx-64/
+/conda/osx-arm64/
+/conda/win-64/
+/CQ-editor-*.zip
+/CQ-editor-*.tar.*
+# pyinstaller.spec and uv.lock are source inputs; keep them in Git.
+
+# Tests, coverage, and tool caches
+.pytest_cache/
+.tox/
+.nox/
+.cache/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+nosetests.xml
+*.cover
+*.prof
+
+# Runtime data, generated CAD exports, and private conversations
+/exports/
+/screenshots/
+.cq-editor/
+chat_sessions/
+.transcripts/
+logs/
+*.log
+*.dmp
+core
+core.*
+
+# Documentation and notebook outputs
+docs/_build/
+.ipynb_checkpoints/
+
+# Editor and machine-specific settings
+.vscode/
+.idea/
+.codex/
+.spyderproject
+.spyproject
+.ropeproject
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini

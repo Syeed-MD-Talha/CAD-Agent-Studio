@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "CQ-editor"
+version = "0.8.dev0"
+dependencies = [
+  "build123d",
+  "PyQt5",
+  "pyqtgraph",
+  "qtawesome==1.4.0",
+  "path",
+  "logbook",
+  "requests",
+  "qtconsole>=5.5.1,<5.7.0",
+  "packaging"
+]
+requires-python = ">=3.10,<=3.14"
+authors = [
+  { name="CadQuery Developers" }
+]
+maintainers = [
+  { name="CadQuery Developers" }
+]
+description = "Cross-platform build123d 3D viewer and optional editor built on PyQt"
+readme = "README.md"
+license = {file = "LICENSE"}
+keywords = ["build123d", "CAD", "engineering", "design"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python"
+]
+
+[project.scripts]
+CQ-editor = "cq_editor.cqe_run:main"
+cq-editor = "cq_editor.cqe_run:main"
+
+[project.optional-dependencies]
+ai = [
+    "anthropic>=0.25.0",
+    "python-dotenv>=1.0.0",
+]
+test = [
+    "pytest",
+    "pluggy",
+    "pytest-qt",
+    "pytest-mock",
+    "pytest-repeat",
+    "pyvirtualdisplay"
+]
+dev = [
+  "black",
+]
+
+[project.urls]
+Repository = "https://github.com/CadQuery/CQ-editor.git"
+"Bug Tracker" = "https://github.com/CadQuery/CQ-editor/issues"

@@ -1,0 +1,23 @@
+name: CQ-editor
+company: Cadquery
+version: master
+icon_image: ../icons/cadquery_logo_dark.ico
+license_file: ../LICENSE
+register_python: False
+initialize_conda: False
+keep_pkgs: False
+
+channels:
+  - conda-forge
+
+specs:
+  - cq-editor=master
+  - build123d
+  - nomkl
+  - mamba
+
+menu_packages: []
+
+extra_files:
+  - run.sh # [unix]
+  - run.bat # [win]
