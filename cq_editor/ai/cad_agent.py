@@ -253,86 +253,16 @@ def extract_python_code(text: str) -> str:
     return ""
 
 
-def build_client(model_override=""):
-    """Create an Anthropic-SDK client honouring .env.
+def build_client(model_override="", provider=None, config=None):
+    """Build a selected provider profile or the configured .env profile.
 
-    Provider priority (first match wins):
-      1. Explicit ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY (Claude direct or any
-         Anthropic-compatible gateway - same as learn-claude-code).
-      2. Fireworks: FIREWORKS_API_KEY (+ optional FIREWORKS_MODEL_ID) via the
-         Anthropic-compatible endpoint https://api.fireworks.ai/inference
-         (note: NO /v1 suffix - that one is OpenAI-compatible only).
-      3. Generic OPENAI_API_KEY + OPENAI_API_BASE passthrough (must speak the
-         Anthropic Messages API).
-
-    model_override: explicit model id from the UI picker (takes precedence
-    over MODEL_ID / FIREWORKS_MODEL_ID env vars). Returns (client, model).
-    Raises RuntimeError with a friendly message if misconfigured.
+    The returned client exposes the Anthropic Messages-shaped interface used by
+    the existing CAD agent. OpenAI-compatible providers are adapted internally.
     """
-    try:
-        from dotenv import load_dotenv
-    except ImportError:
-        raise RuntimeError("Missing dependency: pip install anthropic python-dotenv")
+    from .providers import configured_client
 
-    # Look for .env next to repo root, then cwd.
-    for candidate in (
-        Path(__file__).resolve().parents[2] / ".env",
-        Path.cwd() / ".env",
-    ):
-        if candidate.is_file():
-            load_dotenv(candidate, override=False)
-            break
-    else:
-        load_dotenv(override=False)
-
-    if os.getenv("ANTHROPIC_BASE_URL"):
-        # Same trick as learn-claude-code: drop conflicting auth token var.
-        os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-
-    try:
-        from anthropic import Anthropic
-    except ImportError:
-        raise RuntimeError("Missing dependency: pip install anthropic")
-
-    model = (
-        (model_override or "").strip()
-        or os.getenv("MODEL_ID", "")
-        or os.getenv("FIREWORKS_MODEL_ID", "")
-        or "accounts/fireworks/models/kimi-k2-instruct-0905"
-    )
-
-    # 1. Explicit Anthropic-compatible config.
-    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    base_url = (os.getenv("ANTHROPIC_BASE_URL", "") or "").strip() or None
-    if api_key or base_url:
-        if not api_key and not base_url:
-            pass  # fall through to fireworks
-        else:
-            client = Anthropic(api_key=api_key or None, base_url=base_url)
-            return client, model
-
-    # 2. Fireworks (today's provider).
-    fw_key = os.getenv("FIREWORKS_API_KEY", "").strip()
-    if fw_key:
-        # Allow override but default to the Anthropic-compatible endpoint.
-        fw_base = (
-            os.getenv("FIREWORKS_BASE_URL", "").strip()
-            or os.getenv("ANTHROPIC_BASE_URL", "").strip()
-            or FIREWORKS_ANTHROPIC_BASE_URL
-        )
-        client = Anthropic(api_key=fw_key, base_url=fw_base)
-        return client, model
-
-    # 3. Generic OpenAI-env passthrough (Anthropic-speaking gateway only).
-    oai_key = os.getenv("OPENAI_API_KEY", "").strip()
-    oai_base = os.getenv("OPENAI_API_BASE", "").strip()
-    if oai_key and oai_base:
-        client = Anthropic(api_key=oai_key, base_url=oai_base)
-        return client, model
-
-    raise RuntimeError(
-        "No API key found. For Fireworks: set FIREWORKS_API_KEY in .env "
-        "(see .env.example). For Claude direct: set ANTHROPIC_API_KEY."
+    return configured_client(
+        provider=provider, model_override=model_override, config=config
     )
 
 

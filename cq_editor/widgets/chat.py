@@ -16,7 +16,7 @@ import traceback as tb
 from datetime import datetime
 from pathlib import Path
 
-from PyQt5.QtCore import Qt, QThread, QTimer, QStringListModel, pyqtSignal, pyqtSlot
+from PyQt5.QtCore import Qt, QThread, QTimer, QStringListModel, QSettings, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QIcon, QImage, QPixmap
 from PyQt5.QtWidgets import (
     QWidget,
@@ -36,6 +36,10 @@ from PyQt5.QtWidgets import (
     QFrame,
     QFileDialog,
     QMessageBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QLineEdit,
     QSizePolicy,
     QApplication,
 )
@@ -66,6 +70,7 @@ from ..ai.cad_agent import (
 )
 from ..ai.subagent import run_subagent, run_code_subagent
 from ..ai.sessions import SessionStore, autotitle, DEFAULT_TITLE, is_auto_title
+from ..ai.providers import PROVIDERS, ProviderConfig, ProviderSettings, load_environment
 
 
 # Legacy starter snippet (kept for backward compatibility / tests).
@@ -94,7 +99,7 @@ SLASH_COMMANDS = {
     "/export": "Save this chat as a Markdown transcript",
     "/examples": "List bundled build123d examples",
     "/compact": "Show what auto-compaction sends vs stores",
-    "/model": "Show the active model (from .env)",
+    "/model": "Show the selected provider and model",
     "/effort": "Show or set reasoning effort: /effort [low|medium|high|max]",
     "/help": "List all slash commands",
 }
@@ -262,6 +267,11 @@ class ChatWidget(QWidget, ComponentMixin):
         # Design owned by the active session (editor code, re-rendered on switch).
         self.session_design = ""
         self._auto_apply_verdict = ""
+        load_environment()
+        settings = getattr(parent, "settings", None)
+        if settings is None:
+            settings = QSettings("CadQuery", "CQ-Editor")
+        self._provider_settings = ProviderSettings(settings)
 
         # ---------- left sidebar: sessions ----------
         self.sidebar = QFrame(self)
@@ -325,9 +335,18 @@ class ChatWidget(QWidget, ComponentMixin):
         self.subtitle_label.setObjectName("chatSubtitle")
         title_box.addWidget(self.title_label)
         title_box.addWidget(self.subtitle_label)
-        self.provider_pill = QLabel("● fireworks", header)
+        self.provider_pill = QLabel("● Fireworks", header)
         self.provider_pill.setObjectName("providerPill")
-        self.provider_pill.setToolTip("Active provider (from .env)")
+        self.provider_pill.setToolTip("Active AI provider")
+        self.provider_combo = QComboBox(header)
+        self.provider_combo.setToolTip("Choose the AI provider used for the next request.")
+        for provider_id, spec in PROVIDERS.items():
+            self.provider_combo.addItem(spec.label, provider_id)
+        selected_index = self.provider_combo.findData(self._provider_settings.selected())
+        self.provider_combo.setCurrentIndex(max(0, selected_index))
+        self.api_settings_btn = QPushButton("Provider settings", header)
+        self.api_settings_btn.setObjectName("expBtn")
+        self.api_settings_btn.setToolTip("Set this provider's API key, model, and base URL.")
         self.mode_pill = QLabel("PLAN", header)
         self.mode_pill.setObjectName("modePill")
         self.mode_pill.setToolTip("Plan mode: code is validated, never auto-applied (/plan to toggle)")
@@ -336,6 +355,8 @@ class ChatWidget(QWidget, ComponentMixin):
         hlay.addLayout(title_box, 1)
         hlay.addWidget(self.mode_pill)
         hlay.addWidget(self.provider_pill)
+        hlay.addWidget(self.provider_combo)
+        hlay.addWidget(self.api_settings_btn)
         self.clear_btn = QPushButton(header)
         self.clear_btn.setObjectName("iconBtn")
         self.clear_btn.setToolTip("Start new chat")
@@ -468,12 +489,9 @@ class ChatWidget(QWidget, ComponentMixin):
         self.effort_combo.addItems(["Low", "Medium", "High", "Max"])
         self.effort_combo.setCurrentText("Medium")
         self.effort_combo.setToolTip(self._effort_tooltip())
-        self.model_lbl = QLabel("Model: from .env", self)
+        self.model_lbl = QLabel("Model: not configured", self)
         self.model_lbl.setObjectName("muted")
-        self.model_lbl.setToolTip(
-            "Model id is read from MODEL_ID / FIREWORKS_MODEL_ID in .env. "
-            "Restart the app after changing .env."
-        )
+        self.model_lbl.setToolTip("The provider profile supplies this model ID.")
         toggles_row = QHBoxLayout()
         toggles_row.setSpacing(12)
         toggles_row.addWidget(self.model_lbl, 1)
@@ -489,7 +507,7 @@ class ChatWidget(QWidget, ComponentMixin):
         status_row.setSpacing(6)
         self.status_dot = QLabel("●", self)
         self.status_dot.setObjectName("statusDot")
-        self.status = QLabel("Add FIREWORKS_API_KEY to .env to start.", self)
+        self.status = QLabel("Choose a provider and add its API key in Provider settings.", self)
         self.status.setObjectName("statusLbl")
         self.status.setWordWrap(True)
         self.meter_lbl = QLabel("", self)
@@ -510,6 +528,8 @@ class ChatWidget(QWidget, ComponentMixin):
 
         self._apply_styles()
         self._welcome()
+        self._refresh_provider_pill()
+        self._refresh_model_lbl()
 
         self.send_btn.clicked.connect(self.on_send)
         self.stop_btn.clicked.connect(self.on_stop)
@@ -523,6 +543,8 @@ class ChatWidget(QWidget, ComponentMixin):
         self.undo_btn.clicked.connect(self.on_undo)
         self.plan_check.toggled.connect(self.on_plan_toggled)
         self.effort_combo.currentTextChanged.connect(self.on_effort_changed)
+        self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
+        self.api_settings_btn.clicked.connect(self._edit_provider_settings)
         # Slash-command completion (Claude/Codex "/" popup pattern).
         self.slash_completer = QCompleter(self)
         self.slash_completer.setModel(
@@ -878,6 +900,8 @@ class ChatWidget(QWidget, ComponentMixin):
         self.attach_btn.setEnabled(not busy)
         self.input.setEnabled(not busy)
         self.stop_btn.setEnabled(busy)
+        self.provider_combo.setEnabled(not busy)
+        self.api_settings_btn.setEnabled(not busy)
         try:
             self.status_dot.setStyleSheet(
                 f"color: {'#f59e0b' if busy else '#16a34a'};"
@@ -1518,10 +1542,70 @@ class ChatWidget(QWidget, ComponentMixin):
                 f"max {EFFORTS[level]['max_tokens']})."
             )
 
+    def _selected_provider(self):
+        return self.provider_combo.currentData() or "fireworks"
+
+    def _selected_config(self):
+        return self._provider_settings.get(self._selected_provider())
+
+    def _on_provider_changed(self, _index):
+        provider = self._selected_provider()
+        self._provider_settings.select(provider)
+        self._client = None
+        self._model = ""
+        self._refresh_provider_pill()
+        self._refresh_model_lbl()
+        self.status.setText(f"Selected {PROVIDERS[provider].label}. Configure it in Provider settings if needed.")
+
+    def _edit_provider_settings(self):
+        """Edit a local profile without placing its key in chat history."""
+        config = self._selected_config()
+        spec = PROVIDERS[config.provider]
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"{spec.label} settings")
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+        key = QLineEdit(config.api_key, dialog)
+        key.setEchoMode(QLineEdit.Password)
+        key.setPlaceholderText(f"{spec.key_env} or paste a key")
+        show_key = QCheckBox("Show API key", dialog)
+        show_key.toggled.connect(lambda visible: key.setEchoMode(QLineEdit.Normal if visible else QLineEdit.Password))
+        model = QLineEdit(config.model, dialog)
+        model.setPlaceholderText("Model ID")
+        base_url = QLineEdit(config.base_url, dialog)
+        base_url.setPlaceholderText("https://provider.example/v1")
+        form.addRow("API key:", key)
+        form.addRow("", show_key)
+        form.addRow("Model:", model)
+        form.addRow("API base URL:", base_url)
+        layout.addLayout(form)
+        note = QLabel("Stored locally in application settings, unencrypted. API keys are never added to chat sessions or exports.", dialog)
+        note.setWordWrap(True)
+        note.setObjectName("muted")
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, parent=dialog)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        updated = ProviderConfig(config.provider, key.text().strip(), model.text().strip(), base_url.text().strip())
+        try:
+            self._provider_settings.save(updated)
+        except RuntimeError as error:
+            QMessageBox.warning(self, "Provider settings", str(error))
+            return
+        self._client = None
+        self._model = ""
+        self._refresh_provider_pill()
+        self._refresh_model_lbl()
+        self.status.setText(f"Saved {spec.label} settings.")
+
     def _refresh_model_lbl(self):
         try:
-            model = getattr(self, "_model", "") or "from .env"
+            model = getattr(self, "_model", "") or self._selected_config().model or "not configured"
             self.model_lbl.setText(f"Model: {model} · Effort: {self.effort.title()}")
+            self.model_lbl.setToolTip(f"Selected provider: {PROVIDERS[self._selected_provider()].label}")
         except Exception:
             pass
 
@@ -1626,12 +1710,14 @@ class ChatWidget(QWidget, ComponentMixin):
         return "Auto-apply" if self.preferences["Auto-apply code"] else "Manual"
 
     def _cmd_status(self):
-        model = getattr(self, "_model", "") or "from .env"
+        config = self._selected_config()
+        model = getattr(self, "_model", "") or config.model or "not configured"
         spec = EFFORTS[self.effort]
         budget = spec["budget"]
         self._append(
             "System",
             "Session status\n"
+            f"· Provider: {PROVIDERS[config.provider].label}\n"
             f"· Model: {model}\n"
             f"· Effort: {self.effort.title()} "
             f"({'thinking off' if budget is None else f'think ~{budget}'}"
@@ -1653,12 +1739,13 @@ class ChatWidget(QWidget, ComponentMixin):
         )
 
     def _cmd_model(self):
-        model = getattr(self, "_model", "") or "not connected yet — send a message first"
+        config = self._selected_config()
+        model = getattr(self, "_model", "") or config.model or "not configured"
         self._append(
             "System",
-            f"Active model: {model}\n"
-            "The model always comes from MODEL_ID / FIREWORKS_MODEL_ID in .env "
-            "(restart the app after changing it). Vision-capable: kimi-k3.",
+            f"Provider: {PROVIDERS[config.provider].label}\n"
+            f"Selected model: {model}\n"
+            "Use Provider settings to change its API key, model, or base URL.",
         )
 
     def _cmd_compact(self):
@@ -1858,11 +1945,8 @@ class ChatWidget(QWidget, ComponentMixin):
             self._hist_idx = None
             self._run_slash(prompt)
             return
-        # Model comes from .env ONLY (MODEL_ID / FIREWORKS_MODEL_ID).
-        # No UI override - that was the source of 404s (stale picker value
-        # beating the .env value).
         try:
-            client, model = build_client()
+            client, model = build_client(config=self._selected_config())
         except RuntimeError as e:
             self._append("System", str(e))
             self.status.setText(str(e))
@@ -1905,19 +1989,9 @@ class ChatWidget(QWidget, ComponentMixin):
         self._kick_llm()
 
     def _refresh_provider_pill(self):
-        """Show which backend will serve the request (fireworks/anthropic)."""
-        import os
-
-        base = ""
+        """Show the provider selected for the next request."""
         try:
-            base = (self._client.base_url or "").lower() if self._client else ""
-        except Exception:
-            base = ""
-        label = "fireworks" if "fireworks" in base else (
-            "anthropic" if self._client else "no key"
-        )
-        try:
-            self.provider_pill.setText(f"● {label}")
+            self.provider_pill.setText(f"● {PROVIDERS[self._selected_provider()].label}")
         except Exception:
             pass
 
@@ -2490,13 +2564,14 @@ class ChatWidget(QWidget, ComponentMixin):
             finished_ok = pyqtSignal(object)
             finished_err = pyqtSignal(str)
 
-            def __init__(self, parent, purpose, task, messages, model, effort, image_bytes=None):
+            def __init__(self, parent, purpose, task, messages, model, effort, client, image_bytes=None):
                 super().__init__(parent)
                 self.purpose = purpose
                 self.task = task
                 self.messages = messages
                 self.model = model
                 self.effort = effort
+                self.client = client
                 self.image_bytes = image_bytes
 
             def run(self):
@@ -2513,6 +2588,7 @@ class ChatWidget(QWidget, ComponentMixin):
                             parent_messages=self.messages,
                             model=self.model,
                             effort=self.effort,
+                            client=self.client,
                         )
                     else:
                         result = run_subagent(
@@ -2521,6 +2597,7 @@ class ChatWidget(QWidget, ComponentMixin):
                             model=self.model,
                             effort=self.effort,
                             image_bytes=self.image_bytes,
+                            client=self.client,
                         )
                     self.finished_ok.emit(result)
                 except Exception as e:
@@ -2544,7 +2621,8 @@ class ChatWidget(QWidget, ComponentMixin):
         self._set_busy(True, "Running subagent")
         worker = SubagentWorker(
             self, purpose, task, list(self.messages),
-            getattr(self, "_model", None), self.effort, image_bytes=image_bytes,
+            getattr(self, "_model", None), self.effort, getattr(self, "_client", None),
+            image_bytes=image_bytes,
         )
         result_holder = {"value": None}
 

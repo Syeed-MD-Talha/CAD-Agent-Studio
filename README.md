@@ -17,6 +17,8 @@ It uses build123d for modeling and retains the PyQt5 interface and Open CASCADE
 - Eight bundled examples, from a simple box to sweeps and assemblies.
 - Optional AI chat that can inspect editor code, generate and validate models,
   render changes, and export the result.
+- Provider profiles for Fireworks, Featherless, Anthropic, custom
+  OpenAI-compatible APIs, and custom Anthropic-compatible APIs.
 - Reference image attachments and a Vision toggle for screenshot feedback after
   rendering. These require a provider/model that supports image inputs.
 - Persistent chat sessions with saved design code, editable model selection,
@@ -115,32 +117,32 @@ credentials out of source files, screenshots, and chat transcripts.
 
 | Variable | Purpose |
 | --- | --- |
-| `FIREWORKS_API_KEY` | Fireworks credentials. |
-| `FIREWORKS_MODEL_ID` | Fireworks model ID; the template matches the source default. |
-| `FIREWORKS_BASE_URL` | Optional Fireworks endpoint override. |
-| `ANTHROPIC_API_KEY` | Anthropic credentials or credentials for an Anthropic-compatible gateway. |
-| `ANTHROPIC_BASE_URL` | Optional Anthropic-compatible endpoint override. |
-| `MODEL_ID` | Model default, used ahead of `FIREWORKS_MODEL_ID`. Set this for direct Anthropic use. |
+| `CQ_AI_PROVIDER` | Initial profile: `fireworks`, `featherless`, `anthropic`, `custom_openai`, or `custom_anthropic`. |
+| `FIREWORKS_*` | Fireworks API key, model, and Chat Completions base URL. |
+| `FEATHERLESS_*` | Featherless API key, model, and Chat Completions base URL. |
+| `ANTHROPIC_API_KEY`, `MODEL_ID`, `ANTHROPIC_BASE_URL` | Direct Anthropic / Claude profile. |
+| `OPENAI_API_KEY`, `OPENAI_MODEL_ID`, `OPENAI_API_BASE` | Any OpenAI-compatible Chat Completions service. |
+| `CUSTOM_ANTHROPIC_*` | Any Anthropic Messages-compatible service. |
 | `CQ_SUBAGENT_MODEL_ID` | Optional model default for focused subagent tasks. |
 
-For Fireworks, set `FIREWORKS_API_KEY` and leave the Anthropic fields empty. The
-client's default endpoint is `https://api.fireworks.ai/inference`, without `/v1`.
-For direct Anthropic use, set `ANTHROPIC_API_KEY` and `MODEL_ID`, leaving
-`ANTHROPIC_BASE_URL` empty. An Anthropic key or base URL takes priority over
-Fireworks configuration. A model selected in the chat UI overrides model defaults.
+You can configure profiles in **AI Chat → Provider settings** instead of using
+`.env`. Each profile has its own key, model, and base URL; the selected profile
+is used for the next request. These values are stored locally in application
+settings and are not encrypted, so use an operating-system account you trust.
 
-The client also accepts `OPENAI_API_KEY` together with `OPENAI_API_BASE` as a
-fallback for a gateway that implements the **Anthropic Messages API**. These
-variable names do not enable a native OpenAI API client.
+Fireworks and Featherless use their OpenAI-compatible Chat Completions APIs.
+Custom OpenAI-compatible services must support Chat Completions, function tools,
+and image inputs if you enable Vision. Custom Anthropic-compatible services must
+support the Anthropic Messages API. Model availability and tool or vision support
+depend on the provider and model.
 
 The app loads `.env` from the repository/package root, then the working directory,
 using the first file it finds. Existing process environment variables take
 precedence. Restart the application after changing credentials.
 
-In the **AI Chat** dock, choose a model and describe the part you want. Attach
-reference images or enable **Vision** when your selected model supports images.
-The model picker is editable; its bundled suggestions are not a guarantee of
-provider availability or capability.
+In the **AI Chat** dock, select a provider, open **Provider settings**, and enter
+your key, model, and endpoint. Then describe the part you want. Attach reference
+images or enable **Vision** when the selected model supports image inputs.
 
 ### Execution and data
 

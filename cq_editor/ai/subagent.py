@@ -79,6 +79,7 @@ def run_subagent(
     parent_messages: list[dict[str, Any]] | None = None,
     compact_parent: bool = True,
     image_bytes: bytes | None = None,
+    client=None,
 ) -> dict[str, Any]:
     """Run a focused subagent and return a structured result.
 
@@ -103,7 +104,10 @@ def run_subagent(
     """
     import os
 
-    client, default_model = build_client(model_override=model or "")
+    if client is None:
+        client, default_model = build_client(model_override=model or "")
+    else:
+        default_model = model or ""
     model = model or os.getenv(SUBAGENT_MODEL_ENV, "") or default_model
     effort = normalize_effort(effort)
     if max_tokens is None:
@@ -212,6 +216,7 @@ def run_code_subagent(
     parent_messages: list[dict[str, Any]] | None = None,
     model: str | None = None,
     effort: str | None = None,
+    client=None,
 ) -> dict[str, Any]:
     """Specialised subagent: generate or fix build123d code.
 
@@ -239,4 +244,5 @@ def run_code_subagent(
         effort=effort,
         tools=None,
         parent_messages=parent_messages,
+        client=client,
     )
