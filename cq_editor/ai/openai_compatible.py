@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import requests
 
+from .recovery import MalformedToolCallError, ProviderError
+
 
 class Block(SimpleNamespace):
     def model_dump(self):
@@ -25,7 +27,10 @@ def _content_parts(content):
             parts.append({"type": "text", "text": block.get("text", "")})
         elif block.get("type") == "image":
             source = block["source"]
-            url = source.get("url") or f"data:{source['media_type']};base64,{source['data']}"
+            url = (
+                source.get("url")
+                or f"data:{source['media_type']};base64,{source['data']}"
+            )
             parts.append({"type": "image_url", "image_url": {"url": url}})
     return parts
 
@@ -41,14 +46,24 @@ def _messages(system, messages):
         if role == "assistant":
             item = {
                 "role": "assistant",
-                "content": "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text") or None,
+                "content": "\n".join(
+                    b.get("text", "") for b in blocks if b.get("type") == "text"
+                )
+                or None,
             }
             calls = []
             for block in blocks:
                 if block.get("type") == "tool_use":
-                    calls.append({"id": block["id"], "type": "function", "function": {
-                        "name": block["name"], "arguments": json.dumps(block.get("input", {})),
-                    }})
+                    calls.append(
+                        {
+                            "id": block["id"],
+                            "type": "function",
+                            "function": {
+                                "name": block["name"],
+                                "arguments": json.dumps(block.get("input", {})),
+                            },
+                        }
+                    )
             if calls:
                 item["tool_calls"] = calls
             if item["content"] or calls:
@@ -58,8 +73,16 @@ def _messages(system, messages):
         for block in blocks:
             if block.get("type") == "tool_result":
                 output = _content_parts(block.get("content", ""))
-                text = "\n".join(part["text"] for part in output if part["type"] == "text")
-                converted.append({"role": "tool", "tool_call_id": block["tool_use_id"], "content": text or "Tool completed."})
+                text = "\n".join(
+                    part["text"] for part in output if part["type"] == "text"
+                )
+                converted.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": block["tool_use_id"],
+                        "content": text or "Tool completed.",
+                    }
+                )
                 images.extend(part for part in output if part["type"] == "image_url")
             else:
                 images.extend(_content_parts([block]))
@@ -70,26 +93,47 @@ def _messages(system, messages):
 
 def _response(message, finish_reason, usage=None):
     if finish_reason not in ("stop", "length", "tool_calls"):
-        raise RuntimeError("Provider did not return a completed reply. No generated code was applied.")
+        raise ProviderError(
+            "Provider did not return a completed reply. No generated code was applied.",
+            kind="transient" if finish_reason is None else "unknown",
+        )
     content = []
     if message.get("reasoning_content"):
         content.append(Block(type="thinking", thinking=message["reasoning_content"]))
     if message.get("content"):
         content.append(Block(type="text", text=message["content"]))
+    incomplete_tools = finish_reason == "length" and bool(message.get("tool_calls"))
     if finish_reason != "length":
         for call in message.get("tool_calls") or []:
             try:
                 arguments = json.loads(call["function"].get("arguments") or "{}")
             except (TypeError, ValueError):
-                raise RuntimeError("Provider returned incomplete tool arguments. Retry the request.") from None
+                raise MalformedToolCallError(
+                    "Provider returned incomplete tool arguments. Retry the request."
+                ) from None
             if not isinstance(arguments, dict):
-                raise RuntimeError("Provider returned tool arguments that are not a JSON object.")
-            content.append(Block(type="tool_use", id=call["id"], name=call["function"]["name"], input=arguments))
+                raise MalformedToolCallError(
+                    "Provider returned tool arguments that are not a JSON object."
+                )
+            content.append(
+                Block(
+                    type="tool_use",
+                    id=call["id"],
+                    name=call["function"]["name"],
+                    input=arguments,
+                )
+            )
     usage = usage or {}
     return SimpleNamespace(
         content=content,
-        stop_reason={"length": "max_tokens", "tool_calls": "tool_use"}.get(finish_reason, "end_turn"),
-        usage=SimpleNamespace(input_tokens=usage.get("prompt_tokens", 0), output_tokens=usage.get("completion_tokens", 0)),
+        incomplete_tools=incomplete_tools,
+        stop_reason={"length": "max_tokens", "tool_calls": "tool_use"}.get(
+            finish_reason, "end_turn"
+        ),
+        usage=SimpleNamespace(
+            input_tokens=usage.get("prompt_tokens", 0),
+            output_tokens=usage.get("completion_tokens", 0),
+        ),
     )
 
 
@@ -109,28 +153,69 @@ class CompatibleClient:
             "stream": stream,
         }
         if kwargs.get("tools"):
-            payload["tools"] = [{"type": "function", "function": {
-                "name": tool["name"], "description": tool.get("description", ""),
-                "parameters": tool["input_schema"],
-            }} for tool in kwargs["tools"]]
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool["name"],
+                        "description": tool.get("description", ""),
+                        "parameters": tool["input_schema"],
+                    },
+                }
+                for tool in kwargs["tools"]
+            ]
         try:
             response = requests.post(
                 self.base_url + "/chat/completions",
-                headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
-                json=payload, stream=stream, timeout=(15, 180),
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                stream=stream,
+                timeout=(15, 180),
             )
         except requests.RequestException as error:
             detail = str(error).replace(self._api_key, "[redacted]")[:300]
-            raise RuntimeError(f"Could not connect to the provider at {self.base_url}. {detail}") from None
+            raise ProviderError(
+                f"Could not connect to the provider at {self.base_url}. {detail}",
+                kind="transient",
+            ) from None
         if response.status_code >= 400:
             try:
-                detail = str(response.json().get("error", "")).replace(self._api_key, "[redacted]")[:400]
+                detail = str(response.json().get("error", "")).replace(
+                    self._api_key, "[redacted]"
+                )[:400]
             except (ValueError, AttributeError):
                 detail = ""
             status = response.status_code
+            retry_after = response.headers.get("Retry-After")
             response.close()
-            hints = {401: "Check this provider's API key.", 403: "Check API key permissions.", 404: "Check the model ID and API base URL.", 429: "Rate limit or quota reached; retry later."}
-            raise RuntimeError(f"Provider HTTP {status}. {hints.get(status, 'Check the provider settings.')} {detail}".strip())
+            hints = {
+                401: "Check this provider's API key.",
+                403: "Check API key permissions.",
+                404: "Check the model ID and API base URL.",
+                429: "Rate limit or quota reached; retry later.",
+            }
+            unsupported_stream = (
+                stream
+                and status in (400, 405, 422, 501)
+                and any(
+                    term in detail.lower()
+                    for term in (
+                        "streaming is not supported",
+                        "stream is not supported",
+                        "does not support streaming",
+                        "streaming not supported",
+                    )
+                )
+            )
+            raise ProviderError(
+                f"Provider HTTP {status}. {hints.get(status, 'Check the provider settings.')} {detail}".strip(),
+                status_code=status,
+                retry_after=retry_after,
+                kind="unsupported_stream" if unsupported_stream else None,
+            )
         return response
 
     def create(self, **kwargs):
@@ -139,7 +224,9 @@ class CompatibleClient:
         if not data.get("choices"):
             raise RuntimeError("Provider returned no completion choices.")
         choice = data["choices"][0]
-        return _response(choice.get("message", {}), choice.get("finish_reason"), data.get("usage"))
+        return _response(
+            choice.get("message", {}), choice.get("finish_reason"), data.get("usage")
+        )
 
     def stream(self, **kwargs):
         return _CompletionStream(self, kwargs)
@@ -159,13 +246,20 @@ class _CompletionStream:
     def __iter__(self):
         if "application/json" in self.response.headers.get("Content-Type", "").lower():
             data = self.response.json()
+            if not data.get("choices"):
+                raise ProviderError("Provider returned no completion choices.")
             choice = data.get("choices", [{}])[0]
-            self.final = _response(choice.get("message", {}), choice.get("finish_reason"), data.get("usage"))
+            self.final = _response(
+                choice.get("message", {}),
+                choice.get("finish_reason"),
+                data.get("usage"),
+            )
             for block in self.final.content:
                 if block.type == "text":
                     yield Block(type="text", text=block.text)
             return
         text, reasoning, calls, finish, usage = [], [], {}, None, {}
+        self.response.encoding = "utf-8"
         for line in self.response.iter_lines(decode_unicode=True):
             if not line or not line.startswith("data:"):
                 continue
@@ -173,8 +267,30 @@ class _CompletionStream:
             if payload == "[DONE]":
                 break
             chunk = json.loads(payload)
+            if chunk.get("error"):
+                error = chunk["error"]
+                status = (
+                    error.get("status", error.get("code"))
+                    if isinstance(error, dict)
+                    else None
+                )
+                try:
+                    status = int(status)
+                except (TypeError, ValueError):
+                    status = None
+                detail = (
+                    str(error.get("message", ""))
+                    if isinstance(error, dict)
+                    else str(error)
+                )
+                detail = detail.replace(self.client._api_key, "[redacted]")[:400]
+                raise ProviderError(
+                    "Provider generation error. " + detail, status_code=status
+                )
             usage = chunk.get("usage") or usage
             for choice in chunk.get("choices", []):
+                if choice.get("index", 0) != 0:
+                    continue
                 finish = choice.get("finish_reason") or finish
                 delta = choice.get("delta") or {}
                 if delta.get("content"):
@@ -185,14 +301,28 @@ class _CompletionStream:
                     reasoning.append(thought)
                     yield Block(type="thinking", thinking=thought)
                 for fragment in delta.get("tool_calls") or []:
-                    call = calls.setdefault(fragment["index"], {"id": "", "function": {"name": "", "arguments": ""}})
+                    call = calls.setdefault(
+                        fragment["index"],
+                        {"id": "", "function": {"name": "", "arguments": ""}},
+                    )
                     call["id"] += fragment.get("id") or ""
                     function = fragment.get("function") or {}
                     call["function"]["name"] += function.get("name") or ""
                     call["function"]["arguments"] += function.get("arguments") or ""
         if finish is None:
-            raise RuntimeError("Provider connection ended before the reply completed. Retry the request.")
-        self.final = _response({"content": "".join(text), "reasoning_content": "".join(reasoning), "tool_calls": [calls[i] for i in sorted(calls)]}, finish, usage)
+            raise ProviderError(
+                "Provider connection ended before the reply completed. Retry the request.",
+                kind="transient",
+            )
+        self.final = _response(
+            {
+                "content": "".join(text),
+                "reasoning_content": "".join(reasoning),
+                "tool_calls": [calls[i] for i in sorted(calls)],
+            },
+            finish,
+            usage,
+        )
 
     def get_final_message(self):
         if self.final is None:

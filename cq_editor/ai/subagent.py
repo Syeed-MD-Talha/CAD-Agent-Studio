@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 from typing import Any
+from .skill_store import SkillStore, skill_prompt
 
 from .cad_agent import (
     SYSTEM_PROMPT,
@@ -22,15 +23,18 @@ from .cad_agent import (
     compact_messages,
     max_tokens_for_effort,
     normalize_effort,
+    read_example,
+    isolated_validate,
     thinking_params_for,
 )
-
 
 SUBAGENT_SYSTEM = (
     "You are a focused build123d coding subagent inside CQ-editor. "
     "Complete the task given by the parent agent, then return a concise "
     "final text answer. Do not ask follow-up questions. "
-    "Do not spawn additional subagents."
+    "Use skill_view for relevant CAD workflows, get_examples for bundled source and validate_cad_code to test code. "
+    "You cannot read arbitrary files, change the editor, render, or export. "
+    "Do not claim those actions happened. Do not spawn additional subagents."
 )
 
 # Subagents get a cheaper/faster default model when the env var is set.
@@ -80,6 +84,8 @@ def run_subagent(
     compact_parent: bool = True,
     image_bytes: bytes | None = None,
     client=None,
+    skills=None,
+    cancelled=None,
 ) -> dict[str, Any]:
     """Run a focused subagent and return a structured result.
 
@@ -90,8 +96,8 @@ def run_subagent(
             model selected by build_client().
         effort: reasoning effort (low/medium/high/max); defaults to medium.
         max_tokens: output ceiling; defaults to effort-based ceiling.
-        tools: tool schema available to the subagent. Defaults to the full
-            parent TOOLS set so the subagent can validate/inspect code.
+        tools: tool schema available to the subagent. Defaults to the supported
+            example-reading and isolated code-validation tools.
         parent_messages: optional parent conversation context. When provided,
             the latest user/assistant turns are appended after compaction so
             the subagent understands the design history without seeing every
@@ -114,11 +120,18 @@ def run_subagent(
         max_tokens = max_tokens_for_effort(effort)
     thinking = thinking_params_for(model, effort)
 
-    system = (system_prompt or SUBAGENT_SYSTEM).strip()
+    skills = skills if skills is not None else SkillStore()
+    system = (system_prompt or SUBAGENT_SYSTEM).strip() + skill_prompt(
+        skills, learning=False
+    )
     messages: list[dict[str, Any]] = []
 
     if parent_messages:
-        ctx = compact_messages(parent_messages) if compact_parent else list(parent_messages)
+        ctx = (
+            compact_messages(parent_messages)
+            if compact_parent
+            else list(parent_messages)
+        )
         # Keep only the most recent exchange so the subagent has context
         # without being drowned in old tool results.
         keep = []
@@ -131,33 +144,47 @@ def run_subagent(
 
     user_content: list[dict[str, Any]] = [{"type": "text", "text": task}]
     if image_bytes:
-        user_content.append({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/jpeg",
-                "data": base64.b64encode(image_bytes).decode("ascii"),
-            },
-        })
+        user_content.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": base64.b64encode(image_bytes).decode("ascii"),
+                },
+            }
+        )
     messages.append({"role": "user", "content": user_content})
 
     kwargs = {}
     if thinking is not None:
         kwargs["thinking"] = thinking
 
-    tool_schema = tools if tools is not None else TOOLS
+    tool_schema = (
+        tools
+        if tools is not None
+        else [
+            tool
+            for tool in TOOLS
+            if tool["name"] in ("get_examples", "validate_cad_code", "skill_view")
+        ]
+    )
 
     total_in = 0
     total_out = 0
 
     try:
+        from .recovery import complete
+
         for _ in range(MAX_SUBAGENT_TURNS):
-            response = client.messages.create(
+            response = complete(
+                client,
                 model=model,
                 system=system,
                 messages=messages,
                 tools=tool_schema,
                 max_tokens=max_tokens,
+                cancelled=cancelled or (lambda: False),
                 **kwargs,
             )
             usage = getattr(response, "usage", None)
@@ -178,23 +205,72 @@ def run_subagent(
             # spawn_subagent tool call.
             results = []
             for block in response.content:
-                btype = block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
+                btype = (
+                    block.get("type")
+                    if isinstance(block, dict)
+                    else getattr(block, "type", None)
+                )
                 if btype != "tool_use":
                     continue
-                name = block.get("name") if isinstance(block, dict) else getattr(block, "name", "")
-                if name == "spawn_subagent":
-                    results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.get("id") if isinstance(block, dict) else getattr(block, "id", ""),
-                        "content": "Error: subagents cannot spawn further subagents.",
-                    })
+                name = (
+                    block.get("name")
+                    if isinstance(block, dict)
+                    else getattr(block, "name", "")
+                )
+                arguments = (
+                    block.get("input", {})
+                    if isinstance(block, dict)
+                    else getattr(block, "input", {})
+                )
+                arguments = arguments if isinstance(arguments, dict) else {}
+                if name in ("get_examples", "validate_cad_code", "skill_view"):
+                    if name == "get_examples":
+                        output = read_example(arguments.get("name", ""))
+                    elif name == "skill_view":
+                        output = skills.view(
+                            arguments.get("name", ""), arguments.get("file")
+                        )
+                    else:
+                        output = isolated_validate(arguments.get("code", ""))
+                    results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": (
+                                block.get("id")
+                                if isinstance(block, dict)
+                                else getattr(block, "id", "")
+                            ),
+                            "content": output,
+                            "is_error": output.startswith(
+                                ("Error", "Traceback", "CRASH", "TIMEOUT", "WARNING")
+                            ),
+                        }
+                    )
+                elif name == "spawn_subagent":
+                    results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": (
+                                block.get("id")
+                                if isinstance(block, dict)
+                                else getattr(block, "id", "")
+                            ),
+                            "content": "Error: subagents cannot spawn further subagents.",
+                        }
+                    )
                 else:
                     # The subagent asked for a tool we cannot run here.
-                    results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.get("id") if isinstance(block, dict) else getattr(block, "id", ""),
-                        "content": f"Error: tool '{name}' is not available to subagents.",
-                    })
+                    results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": (
+                                block.get("id")
+                                if isinstance(block, dict)
+                                else getattr(block, "id", "")
+                            ),
+                            "content": f"Error: tool '{name}' is not available to subagents.",
+                        }
+                    )
             messages.append({"role": "user", "content": results})
 
         return {
@@ -217,6 +293,8 @@ def run_code_subagent(
     model: str | None = None,
     effort: str | None = None,
     client=None,
+    skills=None,
+    cancelled=None,
 ) -> dict[str, Any]:
     """Specialised subagent: generate or fix build123d code.
 
@@ -245,4 +323,6 @@ def run_code_subagent(
         tools=None,
         parent_messages=parent_messages,
         client=client,
+        skills=skills,
+        cancelled=cancelled,
     )

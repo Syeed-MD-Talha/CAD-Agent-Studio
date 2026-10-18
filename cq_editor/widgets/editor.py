@@ -72,8 +72,8 @@ class Editor(CodeEditor, ComponentMixin):
             {
                 "name": "Color scheme",
                 "type": "list",
-                "values": ["Light", "Dark"],
-                "value": "Light",
+                "values": ["Follow app", "Light", "Dark"],
+                "value": "Follow app",
             },
             {"name": "Maximum line length", "type": "int", "value": 79},
         ],
@@ -172,6 +172,7 @@ class Editor(CodeEditor, ComponentMixin):
         self.completion_list.installEventFilter(self)
 
         self.highlighter = PythonHighlighter(self.document())
+        self.set_color_scheme(self.preferences["Color scheme"])
 
     def eventFilter(self, watched, event):
         """

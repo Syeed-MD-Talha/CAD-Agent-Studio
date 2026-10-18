@@ -134,6 +134,7 @@ class Debugger(QObject, ComponentMixin):
     sigLocalsChanged = pyqtSignal(dict)
     sigCQChanged = pyqtSignal(dict, bool)
     sigDebugging = pyqtSignal(bool)
+    sigVerification = pyqtSignal(dict)
 
     _frames: List[FrameType]
     _stop_debugging: bool
@@ -184,6 +185,12 @@ class Debugger(QObject, ComponentMixin):
 
         self._frames = []
         self._stop_debugging = False
+        self._rendering = False
+        self._cancel_render = False
+        self.last_job = None
+        self._actions["Run"].append(
+            QAction("Stop CAD build", self, triggered=self.cancel_render)
+        )
 
     def get_current_script(self):
 
@@ -290,10 +297,121 @@ class Debugger(QObject, ComponentMixin):
             module.__dict__.pop(name)
 
     @pyqtSlot(bool)
-    def render(self):
+    def render(self, checked=False):
+
+        chat = self.parent().components.get("chat")
+        if (
+            self._rendering
+            or getattr(self.parent(), "_cad_job_running", False)
+            or (chat and (chat.worker is not None or chat._operation_active))
+        ):
+            return
+        from .cad_job import run_cad_job
+
+        self._rendering = True
+        self._cancel_render = False
+        action = self._actions["Run"][0]
+        action.setEnabled(False)
+        source = self.get_current_script()
+        path = self.get_current_script_path()
+        requirements = getattr(chat, "design_requirements", [])
+        if chat:
+            chat._stop_requested = False
+            chat._validated_job = None
+            chat.verification_report = None
+            chat.verification.invalidate()
+            chat._operation_active = True
+            chat._set_busy(True, "Building and verifying geometry")
+        final_message = "CAD build finished. Review verification results."
+        try:
+            self.parent().statusBar().showMessage(
+                "Building and verifying CAD in a separate process…"
+            )
+            job = run_cad_job(
+                dict(
+                    code=source,
+                    auto_show=True,
+                    requirements=requirements,
+                    filename=str(path) if path else None,
+                    workdir=str(path.parent) if path else None,
+                ),
+                owner=self.parent(),
+                timeout=(
+                    int(chat.preferences["Pre-render timeout (s)"]) if chat else 180
+                ),
+                cancelled=lambda: self._cancel_render,
+            )
+            self.last_job = job
+            if job.get("ok"):
+                self.display_job(job, source)
+            else:
+                final_message = "CAD build failed: " + job.get("error", "Unknown error")
+                try:
+                    if job.get("error", "").startswith("SyntaxError:"):
+                        compile(source, DUMMY_FILE, "exec")
+                    error = RuntimeError(
+                        job.get("traceback") or job.get("error", "CAD build failed")
+                    )
+                    line = job.get("line")
+                    if isinstance(line, int) and 0 < line <= len(source.splitlines()):
+                        exec(
+                            compile(
+                                "\n" * (line - 1) + "raise __cad_exception",
+                                DUMMY_FILE,
+                                "exec",
+                            ),
+                            {"__cad_exception": error},
+                        )
+                    raise error
+                except Exception:
+                    self.sigTraceback.emit(sys.exc_info(), source)
+                self.parent().statusBar().showMessage(
+                    job.get("error", "CAD build failed")
+                )
+        except Exception:
+            final_message = "CAD build could not start. See the traceback panel."
+            self.sigTraceback.emit(sys.exc_info(), source)
+        finally:
+            self._rendering = False
+            action.setEnabled(True)
+            if chat:
+                chat._operation_active = False
+                chat._set_busy(
+                    False,
+                    "CAD build stopped." if self._cancel_render else final_message,
+                )
+
+    def cancel_render(self):
+        self._cancel_render = True
+
+    def display_job(self, job, source):
+        """Publish completed shapes on the GUI thread without re-executing code."""
+        objects = {
+            item["name"]: SimpleNamespace(
+                shape=item["shape"], options=item.get("options", {})
+            )
+            for item in job["objects"]
+        }
+        self.sigRendered.emit(objects)
+        self.sigTraceback.emit(None, source)
+        locals_dict = dict(job.get("locals", {}), b3d=b3d)
+        locals_dict.update(
+            {item["name"]: item["shape"] for item in job.get("extra_shapes", [])}
+        )
+        locals_dict.update({name: item.shape for name, item in objects.items()})
+        self.sigLocals.emit(locals_dict)
+        self.sigVerification.emit(job["report"])
+        if job.get("log"):
+            info(job["log"][-16000:])
+        self.parent().statusBar().showMessage(
+            "CAD build complete. See design verification for measured checks."
+        )
+
+    def render_inline(self, checked=False):
+        """Legacy in-process execution used only by explicit interactive debugging."""
 
         seed(59798267586177)
-        if self.preferences["Reload CQ"]:
+        if self.preferences["Reload build123d"]:
             reload_b3d()
 
         cq_script = self.get_current_script()
@@ -328,6 +446,12 @@ class Debugger(QObject, ComponentMixin):
 
     @pyqtSlot(bool)
     def debug(self, value):
+
+        if value and (
+            self._rendering or getattr(self.parent(), "_cad_job_running", False)
+        ):
+            self._actions["Run"][1].setChecked(False)
+            return
 
         # used to stop the debugging session early
         self._stop_debugging = False

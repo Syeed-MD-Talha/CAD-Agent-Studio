@@ -19,26 +19,49 @@ class Provider:
 
 PROVIDERS = {
     "fireworks": Provider(
-        "Fireworks", "openai", "https://api.fireworks.ai/inference/v1",
-        "FIREWORKS_API_KEY", "FIREWORKS_MODEL_ID",
-        "accounts/fireworks/models/kimi-k2-instruct-0905", "FIREWORKS_BASE_URL",
+        "Fireworks",
+        "openai",
+        "https://api.fireworks.ai/inference/v1",
+        "FIREWORKS_API_KEY",
+        "FIREWORKS_MODEL_ID",
+        "accounts/fireworks/models/kimi-k2-instruct-0905",
+        "FIREWORKS_BASE_URL",
     ),
     "featherless": Provider(
-        "Featherless", "openai", "https://api.featherless.ai/v1",
-        "FEATHERLESS_API_KEY", "FEATHERLESS_MODEL_ID",
-        "Qwen/Qwen3-32B", "FEATHERLESS_BASE_URL",
+        "Featherless",
+        "openai",
+        "https://api.featherless.ai/v1",
+        "FEATHERLESS_API_KEY",
+        "FEATHERLESS_MODEL_ID",
+        "Qwen/Qwen3-32B",
+        "FEATHERLESS_BASE_URL",
     ),
     "anthropic": Provider(
-        "Anthropic (Claude)", "anthropic", "https://api.anthropic.com",
-        "ANTHROPIC_API_KEY", "MODEL_ID", "claude-sonnet-4-6", "ANTHROPIC_BASE_URL",
+        "Anthropic (Claude)",
+        "anthropic",
+        "https://api.anthropic.com",
+        "ANTHROPIC_API_KEY",
+        "MODEL_ID",
+        "claude-sonnet-4-6",
+        "ANTHROPIC_BASE_URL",
     ),
     "custom_openai": Provider(
-        "Custom OpenAI-compatible", "openai", "", "OPENAI_API_KEY",
-        "OPENAI_MODEL_ID", "", "OPENAI_API_BASE",
+        "Custom OpenAI-compatible",
+        "openai",
+        "",
+        "OPENAI_API_KEY",
+        "OPENAI_MODEL_ID",
+        "",
+        "OPENAI_API_BASE",
     ),
     "custom_anthropic": Provider(
-        "Custom Anthropic-compatible", "anthropic", "", "CUSTOM_ANTHROPIC_API_KEY",
-        "CUSTOM_ANTHROPIC_MODEL_ID", "", "CUSTOM_ANTHROPIC_BASE_URL",
+        "Custom Anthropic-compatible",
+        "anthropic",
+        "",
+        "CUSTOM_ANTHROPIC_API_KEY",
+        "CUSTOM_ANTHROPIC_MODEL_ID",
+        "",
+        "CUSTOM_ANTHROPIC_BASE_URL",
     ),
 }
 
@@ -50,7 +73,7 @@ class ProviderConfig:
     model: str = ""
     base_url: str = ""
 
-    def validate(self):
+    def validate(self, require_model=True):
         if self.provider not in PROVIDERS:
             raise RuntimeError("Choose a supported AI provider.")
         spec = PROVIDERS[self.provider]
@@ -58,11 +81,18 @@ class ProviderConfig:
             raise RuntimeError(
                 f"No API key for {spec.label}. Open Provider settings or set {spec.key_env} in .env."
             )
-        if not self.model.strip():
-            raise RuntimeError(f"Enter a model ID for {spec.label} in Provider settings.")
-        parsed = urlsplit(self.base_url.strip())
+        if require_model and not self.model.strip():
+            raise RuntimeError(
+                f"Enter a model ID for {spec.label} in Provider settings."
+            )
+        try:
+            parsed = urlsplit(self.base_url.strip())
+        except ValueError:
+            raise RuntimeError("Enter a valid API base URL.") from None
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
-            raise RuntimeError("Enter an API base URL starting with https:// or http://.")
+            raise RuntimeError(
+                "Enter an API base URL starting with https:// or http://."
+            )
 
 
 def load_environment():
@@ -71,7 +101,10 @@ def load_environment():
         from dotenv import load_dotenv
     except ImportError:
         return
-    for candidate in (Path(__file__).resolve().parents[2] / ".env", Path.cwd() / ".env"):
+    for candidate in (
+        Path(__file__).resolve().parents[2] / ".env",
+        Path.cwd() / ".env",
+    ):
         if candidate.is_file():
             load_dotenv(candidate, override=False)
             return
@@ -127,7 +160,9 @@ class ProviderSettings:
     def get(self, provider):
         config = environment_config(provider)
         for name in ("api_key", "model", "base_url"):
-            value = str(self.store.value(self.PREFIX + provider + "/" + name, "") or "").strip()
+            value = str(
+                self.store.value(self.PREFIX + provider + "/" + name, "") or ""
+            ).strip()
             if value:
                 setattr(config, name, value)
         return config
@@ -135,7 +170,10 @@ class ProviderSettings:
     def save(self, config):
         config.validate()
         for name in ("api_key", "model", "base_url"):
-            self.store.setValue(self.PREFIX + config.provider + "/" + name, getattr(config, name).strip())
+            self.store.setValue(
+                self.PREFIX + config.provider + "/" + name,
+                getattr(config, name).strip(),
+            )
         self.select(config.provider)
 
 
@@ -144,12 +182,22 @@ def create_client(config):
     spec = PROVIDERS[config.provider]
     if spec.protocol == "openai":
         from .openai_compatible import CompatibleClient
+
         return CompatibleClient(config.api_key, config.base_url), config.model
     try:
         from anthropic import Anthropic
     except ImportError:
         raise RuntimeError("Missing AI dependency: pip install anthropic") from None
-    return Anthropic(api_key=config.api_key, base_url=config.base_url), config.model
+    # Recovery is bounded by our harness; avoid the SDK's extra hidden retries.
+    return (
+        Anthropic(
+            api_key=config.api_key,
+            base_url=config.base_url,
+            timeout=180.0,
+            max_retries=0,
+        ),
+        config.model,
+    )
 
 
 def configured_client(provider=None, model_override="", config=None):

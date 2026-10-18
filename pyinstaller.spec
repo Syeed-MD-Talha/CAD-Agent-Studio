@@ -19,6 +19,7 @@ a = Analysis(
     datas=[
         ('cq_editor/icons_res.py', 'cq_editor'),
         ('examples', 'examples'),
+        ('cq_editor/ai/skills', 'cq_editor/ai/skills'),
         *[(str(p), 'parso/python') for p in parso_grammar],
         *collect_data_files('debugpy'),
         *casadi_datas,
@@ -90,13 +91,13 @@ exe = EXE(
     a.binaries,
     a.zipfiles,
     a.datas,
-    name='CQ-editor',
+    name='cad-agent-studio',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
     upx_exclude=[],
     console=False,
-    icon='icons/cadquery_logo_dark.ico',
+    icon='icons/cad_studio_mark.ico',
 )
 

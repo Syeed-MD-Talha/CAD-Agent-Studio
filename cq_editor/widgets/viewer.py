@@ -23,6 +23,7 @@ from OCP.Quantity import (
     Quantity_NOC_BLACK as BLACK,
     Quantity_TOC_RGB as TOC_RGB,
     Quantity_Color,
+    Quantity_TOC_sRGB,
 )
 from OCP.Geom import Geom_Axis1Placement
 from OCP.gp import gp_Ax3, gp_Dir, gp_Pnt, gp_Ax1
@@ -31,6 +32,8 @@ from OCP.Bnd import Bnd_Box
 from ..utils import layout, get_save_filename
 from ..mixins import ComponentMixin
 from ..icons import icon
+from ..theme import theme_for
+from PyQt5.QtGui import QPalette, QColor
 from ..cq_utils import to_occ_color, make_AIS, DEFAULT_FACE_COLOR
 
 from .occt_widget import OCCTWidget
@@ -50,6 +53,7 @@ class OCCViewer(QWidget, ComponentMixin):
         name="Pref",
         children=[
             {"name": "Fit automatically", "type": "bool", "value": True},
+            {"name": "Follow app theme", "type": "bool", "value": True},
             {"name": "Use gradient", "type": "bool", "value": False},
             {"name": "Background color", "type": "color", "value": (95, 95, 95)},
             {"name": "Background color (aux)", "type": "color", "value": (30, 30, 30)},
@@ -148,6 +152,18 @@ class OCCViewer(QWidget, ComponentMixin):
 
         color1 = to_occ_color(self.preferences["Background color"])
         color2 = to_occ_color(self.preferences["Background color (aux)"])
+
+        if self.preferences["Follow app theme"]:
+            dark = QApplication.palette().color(QPalette.Window).lightness() < 128
+            theme = theme_for(dark)
+            background = QColor(theme.viewport)
+            color1 = Quantity_Color(
+                background.redF(),
+                background.greenF(),
+                background.blueF(),
+                Quantity_TOC_sRGB,
+            )
+            color2 = color1
 
         if not self.preferences["Use gradient"]:
             color2 = color1

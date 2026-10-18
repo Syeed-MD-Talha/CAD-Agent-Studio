@@ -6,11 +6,13 @@ Created on Fri May 25 14:47:10 2018
 @author: adam
 """
 
-from PyQt5.QtGui import QIcon
+from PyQt5.QtGui import QIcon, QPalette
+from PyQt5.QtWidgets import QApplication, QAction
 
 from . import icons_res
 
-_icons = {"app": QIcon(":/images/icons/cadquery_logo_dark.svg")}
+_icons = {"app": QIcon(":/images/icons/cad_studio_mark.png")}
+_icon_names = {}
 
 import qtawesome as qta
 
@@ -88,4 +90,15 @@ def icon(name):
 
     args, kwargs = _icons_specs[name]
 
-    return qta.icon(*args, **kwargs)
+    themed = dict(kwargs)
+    themed["color"] = QApplication.palette().color(QPalette.Text)
+    result = qta.icon(*args, **themed)
+    _icon_names[result.cacheKey()] = name
+    return result
+
+
+def refresh_icons(root):
+    for action in root.findChildren(QAction):
+        name = _icon_names.get(action.icon().cacheKey())
+        if name:
+            action.setIcon(icon(name))

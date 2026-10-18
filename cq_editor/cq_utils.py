@@ -33,7 +33,6 @@ from OCP.AIS import AIS_InteractiveObject, AIS_Shape
 from OCP.Quantity import (
     Quantity_TOC_RGB as TOC_RGB,
     Quantity_Color,
-    Quantity_NOC_GOLD as GOLD,
 )
 from OCP.Graphic3d import Graphic3d_NOM_JADE, Graphic3d_MaterialAspect
 from OCP.Prs3d import Prs3d_LineAspect
@@ -41,7 +40,7 @@ from OCP.Aspect import Aspect_TOL_SOLID
 
 from PyQt5.QtGui import QColor
 
-DEFAULT_FACE_COLOR = Quantity_Color(GOLD)
+DEFAULT_FACE_COLOR = Quantity_Color(0.6, 0.6, 0.6, TOC_RGB)
 DEFAULT_MATERIAL = Graphic3d_MaterialAspect(Graphic3d_NOM_JADE)
 
 # Any build123d topological object the viewer can display.
@@ -151,9 +150,7 @@ def make_AIS(
     return ais, shape
 
 
-def export(
-    obj: Union[Shape, List[Shape]], type: str, file, precision=1e-1
-):
+def export(obj: Union[Shape, List[Shape]], type: str, file, precision=1e-1):
 
     comp = to_compound(obj)
 

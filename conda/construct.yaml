@@ -1,7 +1,7 @@
-name: CQ-editor
-company: Cadquery
+name: cad-agent-studio
+company: CAD Agent Studio
 version: master
-icon_image: ../icons/cadquery_logo_dark.ico
+icon_image: ../icons/cad_studio_mark.ico
 license_file: ../LICENSE
 register_python: False
 initialize_conda: False

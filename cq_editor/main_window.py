@@ -1,8 +1,8 @@
 import sys
 from pathlib import Path
 
-from PyQt5.QtCore import QObject, pyqtSignal
-from PyQt5.QtGui import QPalette, QColor
+from PyQt5.QtCore import QObject, pyqtSignal, Qt, QSize, QTimer
+from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import (
     QLabel,
     QMainWindow,
@@ -14,6 +14,11 @@ from PyQt5.QtWidgets import (
     QMenu,
     QProxyStyle,
     QStyle,
+    QStyleFactory,
+    QToolButton,
+    QWidget,
+    QSizePolicy,
+    QTabWidget,
 )
 from logbook import Logger
 import build123d as b3d
@@ -39,14 +44,16 @@ except Exception:
 from . import __version__
 from .utils import (
     dock,
-    add_actions,
     open_url,
     about_dialog,
     check_gtihub_for_updates,
     confirm,
 )
 from .mixins import MainMixin
-from .icons import icon
+from .icons import icon, refresh_icons
+from .theme import apply_application_theme
+from .widgets.workspace import DockHeader, ViewportPanel
+import qtawesome as qta
 from pyqtgraph.parametertree import Parameter
 from .preferences import PreferencesWidget
 
@@ -92,7 +99,7 @@ class DockSeparatorStyle(QProxyStyle):
 
 class MainWindow(QMainWindow, MainMixin):
 
-    name = "CQ-Editor"
+    name = "CAD Agent Studio"
     org = "CadQuery"
 
     preferences = Parameter.create(
@@ -114,6 +121,8 @@ class MainWindow(QMainWindow, MainMixin):
 
         super(MainWindow, self).__init__(parent)
         MainMixin.__init__(self)
+        self.components = {}
+        self.docks = {}
 
         self.setWindowIcon(icon("app"))
 
@@ -121,15 +130,22 @@ class MainWindow(QMainWindow, MainMixin):
         if sys.platform == "win32":
             import ctypes
 
-            myappid = "cq-editor"  # arbitrary string
+            myappid = "cad-agent-studio"  # arbitrary string
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 
+        self._theme = apply_application_theme(
+            self.preferences["Light/Dark Theme"] == "Dark"
+        )
+        self.setDockNestingEnabled(True)
+        self.setTabPosition(Qt.AllDockWidgetAreas, QTabWidget.North)
+        self.resize(1440, 920)
         self.viewer = OCCViewer(self)
-        self.setCentralWidget(self.viewer.canvas)
+        self.viewport_panel = ViewportPanel(self.viewer, self)
+        self.setCentralWidget(self.viewport_panel)
 
         # Make sure the dock separators are wide enough to grab on high-DPI displays.
         # setStyle does not take ownership, so keep a reference on self.
-        self._separator_style = DockSeparatorStyle()
+        self._separator_style = DockSeparatorStyle(QStyleFactory.create("Fusion"))
         self.setStyle(self._separator_style)
 
         self.prepare_panes()
@@ -152,7 +168,12 @@ class MainWindow(QMainWindow, MainMixin):
         self.preferences.sigTreeStateChanged.connect(self.preferencesChanged)
 
         self.restorePreferences()
+        self.preferencesChanged(None, None)
+        self.reset_workspace_layout()
         self.restoreWindow()
+        if not self.settings.value("workspace/designVersion"):
+            self.reset_workspace_layout()
+            self.settings.setValue("workspace/designVersion", 1)
 
         # Handle the event of the editor being hidden or shown
         self.editor_dock = self.docks["editor"]
@@ -188,62 +209,74 @@ class MainWindow(QMainWindow, MainMixin):
         Triggered when the preferences for this window are changed.
         """
 
-        # Use the default light theme/palette
-        if self.preferences["Light/Dark Theme"] == "Light":
-            QApplication.instance().setStyleSheet("")
-            QApplication.instance().setPalette(QApplication.style().standardPalette())
-
-            # The console theme needs to be changed separately
-            self.components["console"].app_theme_changed("Light")
-        # Use the dark theme/palette
-        elif self.preferences["Light/Dark Theme"] == "Dark":
-            QApplication.instance().setStyle("Fusion")
-
-            # Now use a palette to switch to dark colors:
-            white_color = QColor(255, 255, 255)
-            black_color = QColor(0, 0, 0)
-            red_color = QColor(255, 0, 0)
-            palette = QPalette()
-            palette.setColor(QPalette.Window, QColor(53, 53, 53))
-            palette.setColor(QPalette.WindowText, white_color)
-            palette.setColor(QPalette.Base, QColor(25, 25, 25))
-            palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
-            palette.setColor(QPalette.ToolTipBase, black_color)
-            palette.setColor(QPalette.ToolTipText, white_color)
-            palette.setColor(QPalette.Text, white_color)
-            palette.setColor(QPalette.Button, QColor(53, 53, 53))
-            palette.setColor(QPalette.ButtonText, white_color)
-            palette.setColor(QPalette.BrightText, red_color)
-            palette.setColor(QPalette.Link, QColor(42, 130, 218))
-            palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
-            palette.setColor(QPalette.HighlightedText, black_color)
-            QApplication.instance().setPalette(palette)
-
-            # The console theme needs to be changed separately
-            self.components["console"].app_theme_changed("Dark")
-
-        # We alter the color of the toolbar separately to avoid having separate dark theme icons
-        p = self.toolbar.palette()
-        if self.preferences["Light/Dark Theme"] == "Dark":
-            p.setColor(QPalette.Background, QColor(120, 120, 120))
-
-            # TWeak the QMenu items palette for dark theme
-            menu_palette = self.menuBar().palette()
-            menu_palette.setColor(QPalette.Base, QColor(80, 80, 80))
-            for menu in self.menuBar().findChildren(QMenu):
-                menu.setPalette(menu_palette)
+        dark = self.preferences["Light/Dark Theme"] == "Dark"
+        self._theme = apply_application_theme(dark)
+        self.setFont(QApplication.font())
+        self.components["console"].app_theme_changed("Dark" if dark else "Light")
+        for dock_widget in self.docks.values():
+            dock_widget.titleBarWidget().apply_theme(self._theme)
+        self.viewport_panel.apply_theme(self._theme)
+        self.viewer.updatePreferences()
+        self.viewport_panel.projection.setText(
+            self.viewer.preferences["Projection Type"]
+        )
+        self.theme_action.blockSignals(True)
+        self.theme_action.setChecked(dark)
+        self.theme_action.blockSignals(False)
+        self.theme_action.setText("Light theme" if dark else "Dark theme")
+        refresh_icons(self)
+        self.render_button.setIcon(qta.icon("fa5s.play", color="#ffffff"))
+        self.debug_button.setIcon(qta.icon("fa5s.bug", color=self._theme.muted))
+        self.export_button.setIcon(qta.icon("fa5s.download", color=self._theme.muted))
+        self.workspace_button.setIcon(qta.icon("fa5s.columns", color=self._theme.muted))
+        self.preferences_button.setIcon(
+            qta.icon("fa5s.sliders-h", color=self._theme.muted)
+        )
+        self.theme_button.setIcon(
+            qta.icon("fa5s.sun" if dark else "fa5s.moon", color=self._theme.muted)
+        )
+        self.toolbar.setPalette(QApplication.palette())
+        chat = self.components.get("chat")
+        if chat is not None:
+            chat._on_app_theme_changed()
+        editor = self.components["editor"]
+        editor_scheme = editor.preferences["Color scheme"]
+        # Avoid a high-contrast mismatch when switching the application theme:
+        # a light editor in a dark workspace (or vice versa) is almost always
+        # an old saved preference, not an intentional choice.
+        opposite = (dark and editor_scheme == "Light") or (
+            not dark and editor_scheme == "Dark"
+        )
+        if opposite:
+            editor.preferences["Color scheme"] = "Follow app"
         else:
-            p.setColor(QPalette.Background, QColor(240, 240, 240))
-
-            # Revert the QMenu items palette for dark theme
-            menu_palette = self.menuBar().palette()
-            menu_palette.setColor(QPalette.Base, QColor(240, 240, 240))
-            for menu in self.menuBar().findChildren(QMenu):
-                menu.setPalette(menu_palette)
-
-        self.toolbar.setPalette(p)
+            editor.set_color_scheme(editor_scheme)
 
     def closeEvent(self, event):
+
+        chat = self.components.get("chat")
+        debugger = self.components.get("debugger")
+        workers = getattr(chat, "_active_workers", [])
+        if getattr(self, "_cad_job_running", False) or any(
+            worker.isRunning() for worker in workers
+        ):
+            if chat:
+                chat._stop_requested = True
+                for worker in workers:
+                    worker.requestInterruption()
+            if debugger:
+                debugger.cancel_render()
+            self.statusBar().showMessage("Stopping active jobs before closing…")
+            event.ignore()
+            if not getattr(self, "_close_retry_pending", False):
+                self._close_retry_pending = True
+
+                def retry_close():
+                    self._close_retry_pending = False
+                    self.close()
+
+                QTimer.singleShot(200, retry_close)
+            return
 
         self.saveWindow()
         self.savePreferences()
@@ -328,6 +361,15 @@ class MainWindow(QMainWindow, MainMixin):
             )
 
         for d in self.docks.values():
+            display_titles = {
+                "Editor": "Code editor",
+                "Objects": "Model explorer",
+                "CQ object inspector": "Shape inspector",
+                "Current traceback": "Render errors",
+                "Log viewer": "Activity log",
+            }
+            d.setWindowTitle(display_titles.get(d.objectName(), d.windowTitle()))
+            d.setTitleBarWidget(DockHeader(d))
             d.show()
 
         # Connect the bound method rather than a lambda: PRINT_REDIRECTOR is a
@@ -448,20 +490,133 @@ class MainWindow(QMainWindow, MainMixin):
             menus[name].addActions(action)
 
     def prepare_toolbar(self):
-
         self.toolbar = QToolBar("Main toolbar", self, objectName="Main toolbar")
-
-        for c in self.components.values():
-            add_actions(self.toolbar, c.toolbarActions())
-
+        self.toolbar.setMovable(False)
+        self.toolbar.setIconSize(QSize(18, 18))
+        brand_icon = QLabel(self.toolbar)
+        brand_icon.setPixmap(
+            QPixmap(":/images/icons/cad_studio_mark.png").scaled(
+                24, 24, Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+        )
+        brand_icon.setObjectName("studioBrandIcon")
+        self.toolbar.addWidget(brand_icon)
+        brand = QLabel("CAD Agent Studio", self.toolbar)
+        brand.setObjectName("studioBrand")
+        self.toolbar.addWidget(brand)
+        self.toolbar.addSeparator()
+        for action in self.components["editor"]._actions["File"][:3]:
+            self.toolbar.addAction(action)
+        self.toolbar.addSeparator()
+        debugger_actions = self.components["debugger"]._actions["Run"]
+        self.render_button = QToolButton(self.toolbar)
+        self.render_button.setObjectName("renderAction")
+        self.render_button.setDefaultAction(debugger_actions[0])
+        self.render_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toolbar.addWidget(self.render_button)
+        debug_button = QToolButton(self.toolbar)
+        self.debug_button = debug_button
+        debug_button.setText("Debug")
+        debug_button.setIcon(icon("debug"))
+        debug_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        debug_button.setPopupMode(QToolButton.InstantPopup)
+        debug_menu = QMenu(debug_button)
+        debug_menu.addActions(debugger_actions[1:])
+        debug_button.setMenu(debug_menu)
+        self.toolbar.addWidget(debug_button)
+        self.toolbar.addSeparator()
+        export_button = QToolButton(self.toolbar)
+        self.export_button = export_button
+        export_button.setText("Export")
+        export_button.setIcon(qta.icon("fa5s.download"))
+        export_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        export_button.setPopupMode(QToolButton.InstantPopup)
+        export_menu = QMenu(export_button)
+        tree = self.components["object_tree"]
+        export_menu.addActions([tree._export_STEP_action, tree._export_STL_action])
+        export_button.setMenu(export_menu)
+        self.toolbar.addWidget(export_button)
+        spacer = QWidget(self.toolbar)
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.toolbar.addWidget(spacer)
+        workspace = QToolButton(self.toolbar)
+        self.workspace_button = workspace
+        workspace.setText("Workspace")
+        workspace.setIcon(qta.icon("fa5s.columns"))
+        workspace.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        workspace.setPopupMode(QToolButton.InstantPopup)
+        workspace_menu = QMenu(workspace)
+        workspace_menu.addAction("Reset panel layout", self.reset_workspace_layout)
+        workspace_menu.addSeparator()
+        for dock_widget in self.docks.values():
+            workspace_menu.addAction(dock_widget.toggleViewAction())
+        workspace.setMenu(workspace_menu)
+        self.toolbar.addWidget(workspace)
+        self.theme_action = QAction("Dark theme", self, checkable=True)
+        self.theme_action.toggled.connect(
+            lambda checked: self.preferences.__setitem__(
+                "Light/Dark Theme", "Dark" if checked else "Light"
+            )
+        )
+        self.theme_button = QToolButton(self.toolbar)
+        self.theme_button.setDefaultAction(self.theme_action)
+        self.theme_button.setToolTip("Switch light / dark theme")
+        self.toolbar.addWidget(self.theme_button)
+        preferences_button = QToolButton(self.toolbar)
+        self.preferences_button = preferences_button
+        preferences_button.setIcon(icon("preferences"))
+        preferences_button.setToolTip("Preferences")
+        preferences_button.clicked.connect(self.edit_preferences)
+        self.toolbar.addWidget(preferences_button)
         self.addToolBar(self.toolbar)
+
+    def reset_workspace_layout(self):
+        """A focused default; existing saved arrangements are restored after it."""
+        for panel in self.docks.values():
+            panel.setFloating(False)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.docks["editor"])
+        self.splitDockWidget(
+            self.docks["editor"], self.docks["object_tree"], Qt.Vertical
+        )
+        for name in ("variables_viewer", "cq_object_inspector"):
+            self.tabifyDockWidget(self.docks["object_tree"], self.docks[name])
+            self.docks[name].hide()
+        for name in ("console", "log", "traceback_viewer"):
+            self.addDockWidget(Qt.BottomDockWidgetArea, self.docks[name])
+        self.tabifyDockWidget(self.docks["console"], self.docks["log"])
+        self.tabifyDockWidget(self.docks["console"], self.docks["traceback_viewer"])
+        for name in ("console", "log", "traceback_viewer"):
+            self.docks[name].hide()
+        if "chat" in self.docks:
+            self.addDockWidget(Qt.RightDockWidgetArea, self.docks["chat"])
+            self.docks["chat"].show()
+            self.resizeDocks([self.docks["chat"]], [480], Qt.Horizontal)
+            self.docks["chat"].raise_()
+        self.docks["editor"].show()
+        self.docks["object_tree"].show()
+        self.docks["object_tree"].raise_()
+        self.resizeDocks([self.docks["editor"]], [380], Qt.Horizontal)
+        self.resizeDocks(
+            [self.docks["editor"], self.docks["object_tree"]], [520, 200], Qt.Vertical
+        )
 
     def prepare_statusbar(self):
 
-        self.status_label = QLabel("", parent=self)
-        self.statusBar().insertPermanentWidget(0, self.status_label)
+        self.status_label = QLabel("Ready", parent=self)
+        self.statusBar().addWidget(self.status_label, 1)
+        self.cursor_status = QLabel("Ln 1, Col 1", self)
+        self.statusBar().addPermanentWidget(self.cursor_status)
+        self.statusBar().addPermanentWidget(QLabel("build123d  ·  Python", self))
 
     def prepare_actions(self):
+
+        if "chat" in self.components:
+            self.components["debugger"].sigVerification.connect(
+                self.components["chat"]._show_verification
+            )
+            self.components["editor"].textChanged.connect(
+                self.components["chat"]._on_editor_changed
+            )
 
         self.components["debugger"].sigRendered.connect(
             self.components["object_tree"].addObjects
@@ -476,6 +631,16 @@ class MainWindow(QMainWindow, MainMixin):
             self.components["console"].push_vars
         )
 
+        self.components["object_tree"].sigObjectsAdded[list].connect(
+            self._update_object_count
+        )
+        self.components["object_tree"].sigObjectsAdded[list, bool].connect(
+            self._update_object_count
+        )
+        self.components["object_tree"].sigObjectsRemoved.connect(
+            self._update_object_count
+        )
+        self.components["debugger"].sigTraceback.connect(self._show_render_error)
         self.components["object_tree"].sigObjectsAdded[list].connect(
             self.components["viewer"].display_many
         )
@@ -555,6 +720,26 @@ class MainWindow(QMainWindow, MainMixin):
         )
         # Allows updating of the status bar from the Editor
         self.components["editor"].statusChanged.connect(self.update_statusbar)
+        self.components["editor"].cursorPositionChanged.connect(
+            self._update_cursor_status
+        )
+
+    def _update_cursor_status(self):
+        cursor = self.components["editor"].textCursor()
+        self.cursor_status.setText(
+            f"Ln {cursor.blockNumber() + 1}, Col {cursor.positionInBlock() + 1}"
+        )
+
+    def _update_object_count(self, *_):
+        count = self.components["object_tree"].CQ.childCount()
+        self.viewport_panel.object_count.setText(
+            f"{count} object{'s' if count != 1 else ''}"
+        )
+
+    def _show_render_error(self, exc_info, _code):
+        if exc_info:
+            self.docks["traceback_viewer"].show()
+            self.docks["traceback_viewer"].raise_()
 
     def prepare_console(self):
 
@@ -609,7 +794,7 @@ class MainWindow(QMainWindow, MainMixin):
     def fill_dummy(self):
 
         self.components["editor"].set_text(
-            'from build123d import *\nresult = Box(3, 3, 0.5)\nshow_object(result)'
+            "from build123d import *\nresult = Box(3, 3, 0.5)\nshow_object(result)"
         )
 
     def setup_logging(self):
@@ -645,15 +830,13 @@ class MainWindow(QMainWindow, MainMixin):
 
         about_dialog(
             self,
-            f"About CQ-editor",
-            f"PyQt GUI for build123d.\nVersion: {__version__}.\nSource Code: https://github.com/CadQuery/CQ-editor",
+            "About CAD Agent Studio",
+            f"AI-assisted build123d CAD workspace.\nVersion: {__version__}",
         )
 
     def check_for_cq_updates(self):
 
-        check_gtihub_for_updates(
-            self, b3d, github_org="gumyr", github_proj="build123d"
-        )
+        check_gtihub_for_updates(self, b3d, github_org="gumyr", github_proj="build123d")
 
     def documentation(self):
 

@@ -166,9 +166,7 @@ class CQObjectInspector(QTreeWidget, ComponentMixin):
 
         # Assembly structure for Compounds with children.
         try:
-            children = (
-                tuple(cq_obj.children) if isinstance(cq_obj, Compound) else ()
-            )
+            children = tuple(cq_obj.children) if isinstance(cq_obj, Compound) else ()
         except Exception:
             children = ()
 

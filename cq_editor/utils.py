@@ -128,9 +128,7 @@ def get_open_filename(suffix, curr_dir):
     return rv
 
 
-def check_gtihub_for_updates(
-    parent, mod, github_org="gumyr", github_proj="build123d"
-):
+def check_gtihub_for_updates(parent, mod, github_org="gumyr", github_proj="build123d"):
 
     url = f"https://api.github.com/repos/{github_org}/{github_proj}/releases"
     resp = requests.get(url).json()

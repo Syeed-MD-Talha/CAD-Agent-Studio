@@ -1,9 +1,18 @@
-from PyQt5.QtWidgets import QTreeWidget, QTreeWidgetItem, QStackedWidget, QDialog
+from PyQt5.QtWidgets import (
+    QTreeWidget,
+    QTreeWidgetItem,
+    QStackedWidget,
+    QDialog,
+    QLabel,
+    QVBoxLayout,
+    QDialogButtonBox,
+)
 from PyQt5.QtCore import pyqtSlot, Qt
 
 from pyqtgraph.parametertree import ParameterTree
 
 from .utils import splitter, layout
+from .theme import theme_for, dialog_styles
 
 
 class PreferencesTreeItem(QTreeWidgetItem):
@@ -29,6 +38,10 @@ class PreferencesWidget(QDialog):
         )
 
         self.stacked = QStackedWidget(self)
+        self.resize(820, 580)
+        self.setMinimumSize(640, 440)
+        dark = parent.preferences["Light/Dark Theme"] == "Dark"
+        self.setStyleSheet(dialog_styles(theme_for(dark)))
         self.preferences_tree = QTreeWidget(
             self,
             headerHidden=True,
@@ -38,6 +51,8 @@ class PreferencesWidget(QDialog):
         )
 
         self.root = self.preferences_tree.invisibleRootItem()
+        self.preferences_tree.setObjectName("preferencesNavigation")
+        self.preferences_tree.setMinimumWidth(185)
 
         self.add("General", parent)
 
@@ -45,9 +60,32 @@ class PreferencesWidget(QDialog):
             self.add(v.name, v)
 
         self.splitter = splitter((self.preferences_tree, self.stacked), (2, 5))
-        layout(self, (self.splitter,), self)
+        self.splitter.setChildrenCollapsible(False)
+        content = QVBoxLayout(self)
+        content.setContentsMargins(24, 22, 24, 20)
+        content.setSpacing(16)
+        heading = QLabel("Make this workspace yours", self)
+        heading.setObjectName("dialogHeading")
+        description = QLabel(
+            "Appearance, editor behavior and 3D view settings. Changes apply immediately.",
+            self,
+        )
+        description.setObjectName("dialogDescription")
+        description.setWordWrap(True)
+        content.addWidget(heading)
+        content.addWidget(description)
+        content.addWidget(self.splitter, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close, self)
+        buttons.rejected.connect(self.accept)
+        content.addWidget(buttons)
 
         self.preferences_tree.currentItemChanged.connect(self.handleSelection)
+        self.preferences_tree.setCurrentItem(self.root.child(0))
+        parent.preferences.sigTreeStateChanged.connect(self._refresh_theme)
+
+    def _refresh_theme(self, *_):
+        dark = self.parent().preferences["Light/Dark Theme"] == "Dark"
+        self.setStyleSheet(dialog_styles(theme_for(dark)))
 
     def add(self, name, component):
 
@@ -63,7 +101,7 @@ class PreferencesWidget(QDialog):
             for child in component.preferences.children():
                 # Fill the editor color scheme drop down list
                 if child.name() == "Color scheme":
-                    child.setLimits(["Light", "Dark"])
+                    child.setLimits(["Follow app", "Light", "Dark"])
                 # Fill the camera projection type
                 elif child.name() == "Projection Type":
                     child.setLimits(

@@ -11,13 +11,14 @@ TEMPLATE = """<RCC>
 ITEM_TEMPLATE = "<file>{}</file>"
 
 QRC_OUT = "icons.qrc"
-RES_OUT = "src/icons_res.py"
+RES_OUT = "cq_editor/icons_res.py"
 TOOL = "pyrcc5"
 
 items = []
 
-for i in glob("icons/*.svg"):
-    items.append(ITEM_TEMPLATE.format(i))
+for pattern in ("icons/*.svg", "icons/*.png"):
+    for i in glob(pattern):
+        items.append(ITEM_TEMPLATE.format(i))
 
 
 qrc_text = TEMPLATE.format("\n".join(items))

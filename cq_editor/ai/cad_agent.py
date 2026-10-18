@@ -24,6 +24,7 @@ import re
 import sys
 import traceback
 from pathlib import Path
+from .skill_store import SKILL_TOOLS, skill_prompt
 
 SYSTEM_PROMPT = """You are a build123d CAD assistant inside CQ-editor.
 Generate working build123d Python code (Algebra mode) from the user's natural-language request.
@@ -39,37 +40,59 @@ Rules:
    on `part.edges().filter_by(Axis.Z)` style selectors, `Hole`/`CounterBoreHole`
    /`CounterSinkHole`, boolean ops (`part + other`, `part - other`, `part & other`).
 5. Keep dimensions parametric and in mm. Reply with a short explanation plus
-   ONE ```python fenced block with the full script.
+   ONE ```python fenced block with the full script. Write only the final
+   implementation: no abandoned approaches, speculative APIs, or reasoning
+   embedded in executable code. Preserve every requested feature.
 6. If a tool result contains a traceback, fix the code and try again.
 7. Prefer simple, robust code over exotic features.
-8. Lofting custom cross-sections (vases, twisted/tapered shapes):
-   build faces with `Plane.XY * Circle(r)` / `Plane.XY.offset(h) * Circle(r)`
-   (or `Rectangle`), loft with `loft([face1, face2, ...], ruled=False)`,
-   which returns a solid Part. Hollow shells: loft an outer solid and a
-   smaller inner solid, then `outer - inner`; keep the inner cavity shorter
-   at the bottom so the floor stays closed.
-9. Threads (bolts, nuts): NEVER model a real helical thread sweep - it is
-   slow and usually fails. Model the shaft as a plain cylinder at the nominal
-   diameter, add a standard hex head (6-sided `Polygon` prism) and a matching hex
-   nut (hex prism with a cylinder cut for the hole), and state the thread
-   spec (e.g. M12x1.75) in your text reply instead.
+8. For changing cross-sections, hollow lofts and curved paths, load the
+   lofts-and-sweeps skill when skill_view is available.
+9. Threads: when the user requests real threads, build real helical geometry;
+   do not silently substitute a plain cylinder. Load the threaded-fasteners
+   skill when skill_view is available; it links the tested Helix/sweep example.
+   If a requested feature cannot be built, explain that limitation honestly.
 10. Multi-part requests (bolt + nut, assemblies): build each part separately
     and call `show_object` once per part with a distinct name. For assemblies,
     combine with `Compound(children=[part1, part2])`.
-11. Tool workflow: ALWAYS call `validate_cad_code` with your script first;
-    only call `apply_and_render` after validation returns OK. If validation
-    returns a traceback, fix the API usage and re-validate.
+11. Tool workflow: when CAD tools are available, generate the design promptly,
+    call `validate_cad_code` with the complete script, then `apply_and_render`
+    after validation returns OK. A failed script is NOT in the editor:
+    repair the script from the previous response/tool arguments using the
+    failing line and API guidance, rather than fetching an empty editor.
+    Use get_examples(name="...") to READ an example, not just list names.
+    Avoid repeated inspection or delegation instead of generating the design.
+    When tools are unavailable or you are told to return code directly,
+    return the complete fenced script; the app validates it automatically.
+    Use only advertised tools. If apply_and_render is unavailable, return the
+    validated script for the parent/app to render instead of claiming a render.
+    Both tools REQUIRE a `code` argument with the COMPLETE non-empty Python
+    script. Never send empty arguments, null, whitespace, or a partial script.
 12. Reference images: the user may attach a sketch or photo. Study the shapes,
     proportions, holes and features visible in the image and reproduce them in
     mm. If dimensions are not readable, choose sensible values and state your
     assumptions in the reply.
 13. Visual feedback: after every successful `apply_and_render`, the tool result
     includes a JPEG screenshot of the current 3D view plus the render status.
-    ALWAYS inspect this screenshot before replying: compare proportions, holes,
+    If a screenshot is provided, inspect it before replying: compare proportions, holes,
     placement and overall shape against the request. If it looks wrong, fix the
     code and call `validate_cad_code` + `apply_and_render` again (up to the
     iteration limit). Only describe the design as done when the screenshot
     matches the request.
+
+build123d API reference (use these exact call forms):
+- Position shapes with `Pos(x, y, z) * shape` or `plane * sketch`.
+  `shape.located(...)` and `.move(...)` require a Location, NOT a Plane.
+  To use an absolute plane placement: `shape.located(plane.location)`.
+- Extrude sketches using the GLOBAL `extrude(sketch, amount=height)`;
+  do not use `sketch.extrude(amount=height)`.
+- A hexagon is `RegularPolygon(radius, side_count=6)`, with circumradius
+  equal to across_flats / sqrt(3). `Polygon` requires explicit vertices.
+- Custom offset profiles use `Polygon(*points, align=None)` so their
+  coordinates are preserved. `Plane.XZ * Polygon(...)` creates an XZ face.
+- Helix uses `Helix(pitch=p, height=h, radius=r)`; a helical ridge uses
+  `sweep(profile, path=helix, is_frenet=True)`. Read the thread example.
+- Primitives are centered by default. For a shaft starting at z=0 use
+  `Cylinder(r, h, align=(Align.CENTER, Align.CENTER, Align.MIN))`.
 
 Example:
 ```python
@@ -156,6 +179,7 @@ def thinking_params_for(model: str, effort=DEFAULT_EFFORT):
         return {"type": "enabled", "budget_tokens": budget}
     return None
 
+
 # Anthropic tool_use specs (also convertible to OpenAI functions).
 TOOLS = [
     {
@@ -168,7 +192,7 @@ TOOLS = [
         "description": "Syntax-check + dry-run build123d code without touching the viewer. Returns OK or traceback.",
         "input_schema": {
             "type": "object",
-            "properties": {"code": {"type": "string"}},
+            "properties": {"code": {"type": "string", "minLength": 1}},
             "required": ["code"],
         },
     },
@@ -182,14 +206,23 @@ TOOLS = [
         ),
         "input_schema": {
             "type": "object",
-            "properties": {"code": {"type": "string"}},
+            "properties": {"code": {"type": "string", "minLength": 1}},
             "required": ["code"],
         },
     },
     {
         "name": "get_examples",
-        "description": "List bundled build123d example names to reference correct API usage.",
-        "input_schema": {"type": "object", "properties": {}, "required": []},
+        "description": "Read the complete source of a bundled build123d example by name. Omit name to list available examples.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Example stem, e.g. 06_sweep or 09_threaded_bolt_and_nut",
+                }
+            },
+            "required": [],
+        },
     },
     {
         "name": "export_model",
@@ -226,7 +259,13 @@ TOOLS = [
                 },
                 "purpose": {
                     "type": "string",
-                    "enum": ["code", "validate", "visual_validate", "export", "explain"],
+                    "enum": [
+                        "code",
+                        "validate",
+                        "visual_validate",
+                        "export",
+                        "explain",
+                    ],
                     "description": (
                         "What kind of subtask this is. "
                         "visual_validate captures the current 3D viewer screenshot "
@@ -239,6 +278,95 @@ TOOLS = [
         },
     },
 ]
+TOOLS.extend(SKILL_TOOLS)
+
+TOOLS.extend(
+    [
+        {
+            "name": "set_design_requirements",
+            "description": "Record measurable requirements from the user's request BEFORE modelling. Preserve requested values, units converted to mm, explicit tolerances, and quote each source phrase. These checks are measured independently on completed geometry and shown to the user. Do not invent specifications or relax a failed requirement. Target/other are exact show_object names. ALWAYS set target for a part-specific check (e.g. jar bore target='jar'); use target='all' for the entire assembly. For older blank targets the verifier scopes to an exact unambiguous object name in the requirement text, otherwise all objects. Hole checks cover inward cylindrical bores only (counterbore stages count separately). Unsupported wall-thickness checks remain Not checked.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "requirements": {
+                        "type": "array",
+                        "maxItems": 100,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {
+                                    "type": "string",
+                                    "enum": [
+                                        "extent",
+                                        "hole_diameter",
+                                        "hole_count",
+                                        "solid_count",
+                                        "object_count",
+                                        "min_clearance",
+                                        "max_overlap_volume",
+                                        "wall_thickness",
+                                    ],
+                                },
+                                "label": {"type": "string"},
+                                "source": {"type": "string"},
+                                "target": {"type": "string"},
+                                "other": {"type": "string"},
+                                "axis": {"type": "string", "enum": ["X", "Y", "Z"]},
+                                "expected": {"type": "number", "minimum": 0},
+                                "tolerance": {"type": "number", "minimum": 0},
+                            },
+                            "required": ["kind", "expected", "label", "source"],
+                        },
+                    }
+                },
+                "required": ["requirements"],
+            },
+        },
+        {
+            "name": "verify_design",
+            "description": "Measure the current editor design against recorded requirements in a cancellable isolated process. Returns Passed/Failed/Not checked with dimensions, cylindrical bore measurements, solid counts, overlap and clearance. Does not change the viewport.",
+            "input_schema": {"type": "object", "properties": {}, "required": []},
+        },
+        {
+            "name": "record_visual_review",
+            "description": "After inspecting the attached labelled design views against the request/reference, record your AI visual assessment. This does not certify measurements or engineering suitability. Report occluded/uncertain features as Not checked. Available only after view capture for the current design.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["Passed", "Failed", "Not checked"],
+                    },
+                    "notes": {
+                        "type": "string",
+                        "description": "Views inspected, matched features, discrepancies, and any remaining uncertainty.",
+                    },
+                },
+                "required": ["status", "notes"],
+            },
+        },
+    ]
+)
+
+SYSTEM_PROMPT += """\nDesign verification: Before generating or modifying a model, call set_design_requirements with the measurable requirements from the user, including the exact source phrase. Preserve prior requirements that still apply when modifying a model. Never substitute assumed dimensions for explicit requested values. If only a picture is provided, mark inferred values as assumptions in the source. The user can review and edit the checks. Geometry is measured independently after the build; fix Failed checks without weakening their expected values. Do not claim Not checked items passed. A successful build is not complete design verification. Vision feedback includes labelled isometric, front, top and side views when available; compare each view to the request and call record_visual_review with your assessment and remaining uncertainty. AI visual assessments are separate from measured geometry checks. Exports are reopened and checked, with mesh limitations reported explicitly.\n"""
+
+
+def build_system_prompt(skills=None, learning=True):
+    """Expose skill descriptions here; bodies and examples stay in tool results."""
+    return (
+        SYSTEM_PROMPT
+        + (
+            "\nVerification scope: use an explicit show_object name for requirements about one part, "
+            "and target='all' only for assembly-wide checks. A displayed object count does not "
+            "prove each part is a single solid. If the report flags multi-solid objects, inspect "
+            "whether those pieces are intentional; repair disconnected fragments when the user "
+            "expects a continuous part and check solid_count on that named part. A verifier error "
+            "means the check is unavailable, not that the modelling code failed. Never claim an "
+            "unavailable measurement or multi-solid part has been fully verified.\n"
+        )
+        + skill_prompt(skills, learning=learning)
+    )
+
 
 _CODE_FENCE_RE = re.compile(r"```(?:python)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 
@@ -274,10 +402,13 @@ def call_llm(client, model, messages, max_tokens=None, effort=DEFAULT_EFFORT):
         kwargs["thinking"] = thinking
     if max_tokens is None:
         max_tokens = max_tokens_for_effort(effort)
-    return client.messages.create(
+    from .recovery import complete
+
+    return complete(
+        client,
         model=model,
-        system=SYSTEM_PROMPT,
-        messages=compact_messages(messages),
+        system=build_system_prompt(),
+        messages=messages,
         tools=TOOLS,
         max_tokens=max_tokens,
         **kwargs,
@@ -332,8 +463,10 @@ def _compact_block(block):
             block["text"] = text[:_KEEP_TEXT] + "\n…[older reply truncated]"
     elif btype == "image":
         # Stale reference photos: keep the turn readable, drop the payload.
-        return {"type": "text",
-                "text": "[earlier reference image omitted to save context]"}
+        return {
+            "type": "text",
+            "text": "[earlier reference image omitted to save context]",
+        }
     elif btype == "tool_use":
         inp = dict(block.get("input") or {})
         code = inp.get("code")
@@ -359,14 +492,18 @@ def _compact_block(block):
             for sub in content:
                 if isinstance(sub, dict) and sub.get("type") == "image":
                     compacted_content.append(
-                        {"type": "text",
-                         "text": "[earlier 3D screenshot omitted to save context]"}
+                        {
+                            "type": "text",
+                            "text": "[earlier 3D screenshot omitted to save context]",
+                        }
                     )
                 elif isinstance(sub, dict) and sub.get("type") == "text":
                     text = sub.get("text", "") or ""
                     if len(text) > _KEEP_RESULT:
                         sub = dict(sub)
-                        sub["text"] = text[:_KEEP_RESULT] + "\n…[older result truncated]"
+                        sub["text"] = (
+                            text[:_KEEP_RESULT] + "\n…[older result truncated]"
+                        )
                     compacted_content.append(sub)
                 else:
                     compacted_content.append(sub)
@@ -420,6 +557,61 @@ def compact_messages(messages):
     return payload
 
 
+def read_example(name="", examples_dir=None):
+    """Read only a named bundled example, never an arbitrary model-supplied path."""
+    directory = (
+        Path(examples_dir)
+        if examples_dir
+        else Path(__file__).resolve().parents[2] / "examples"
+    )
+    examples = {path.stem: path for path in sorted(directory.glob("*.py"))}
+    if not name:
+        return (
+            "Examples (call get_examples with a name to read the source): "
+            + ", ".join(examples)
+        )
+    if not isinstance(name, str):
+        return "Error: example name must be a string."
+    stem = name[:-3] if name.endswith(".py") else name
+    if stem not in examples:
+        return "Error: unknown bundled example. Available: " + ", ".join(examples)
+    return (
+        f"Example {stem}:\n```python\n{examples[stem].read_text(encoding='utf-8')}\n```"
+    )
+
+
+def validation_failure(code, detail, line=None, error="", version=""):
+    """Put actionable source context ahead of the often long native traceback."""
+    lines = code.splitlines()
+    source = lines[line - 1].strip() if line and 0 < line <= len(lines) else ""
+    summary = (
+        error.splitlines()[0][:300] if error else detail.strip().splitlines()[-1][:300]
+    )
+    heading = f"Traceback: {summary}"
+    if line:
+        heading += f" (script line {line})"
+    if source:
+        heading += "\nFailing code: " + source
+    hints = []
+    if (".located(" in source or ".move(" in source) and "Location" in detail:
+        hints.append(
+            "located()/move() take a Location, not a Plane. Use shape.located(plane.location) for absolute placement, or plane * sketch / Pos(x, y, z) * shape for transformations."
+        )
+    if ".extrude(" in source and ("amount" in detail or "argument" in detail):
+        hints.append(
+            "Use the global extrude(sketch, amount=height), not sketch.extrude(amount=height)."
+        )
+    if "Polygon(" in source and "RegularPolygon(" not in source:
+        hints.append(
+            "Polygon requires explicit vertices. A hexagon is RegularPolygon(radius, side_count=6); custom offset vertices need align=None."
+        )
+    if hints:
+        heading += "\nAPI guidance: " + " ".join(hints)
+    if version:
+        heading += f"\nbuild123d version: {version}"
+    return heading + "\n" + detail
+
+
 def headless_validate(code: str) -> str:
     """Compile + exec code with stubbed show_object/debug/log.
 
@@ -449,8 +641,23 @@ def headless_validate(code: str) -> str:
     }
     try:
         exec(compiled, namespace, namespace)
-    except Exception:
-        return "Traceback:\n" + traceback.format_exc(limit=5)
+    except Exception as error:
+        frames = traceback.extract_tb(error.__traceback__)
+        line = next(
+            (
+                frame.lineno
+                for frame in reversed(frames)
+                if frame.filename == "<cad-agent-validate>"
+            ),
+            None,
+        )
+        return validation_failure(
+            code,
+            traceback.format_exc(limit=5),
+            line,
+            f"{type(error).__name__}: {error}",
+            _b3d.__version__,
+        )
     if not shown:
         return "WARNING: code ran but show_object() was never called. Add show_object(result)."
     n = len(shown)
@@ -488,7 +695,7 @@ namespace = {
     "b3d": __import__("build123d"),
     "build123d": __import__("build123d"),
     "show_object": lambda obj, name=None, options=None: shown.update(
-        {name or f"obj{len(shown)}": True}
+        {name or f"obj{len(shown)}": obj}
     ),
     "debug": lambda *a, **k: None,
     "log": lambda *a, **k: None,
@@ -496,10 +703,32 @@ namespace = {
 }
 try:
     exec(compiled, namespace, namespace)
-except Exception:
+except Exception as error:
+    frames = traceback.extract_tb(error.__traceback__)
+    line = next((frame.lineno for frame in reversed(frames)
+                 if frame.filename == "<cad-agent-probe>"), None)
     print("RESULT " + json.dumps({"ok": False, "kind": "traceback",
+          "line": line, "error": f"{type(error).__name__}: {error}",
+          "version": build123d.__version__,
           "detail": traceback.format_exc(limit=5)[-4000:]}), flush=True)
     raise SystemExit(0)
+for name, obj in shown.items():
+    if isinstance(obj, build123d.BuildPart):
+        obj = obj.part
+    elif isinstance(obj, build123d.BuildSketch):
+        obj = obj.sketch
+    elif isinstance(obj, build123d.BuildLine):
+        obj = obj.line
+    try:
+        wrapped = getattr(obj, "_wrapped", None)
+        valid = (isinstance(obj, build123d.Shape) and wrapped is not None
+                 and not wrapped.IsNull() and obj.is_valid and bool(obj.vertices()))
+    except Exception:
+        valid = False
+    if not valid:
+        print("RESULT " + json.dumps({"ok": False, "kind": "geometry",
+              "detail": f"show_object({name}) received empty, invalid, or non-build123d geometry. Build a valid shape before showing it."}), flush=True)
+        raise SystemExit(0)
 if not shown:
     print("RESULT " + json.dumps({"ok": True, "warning": True, "objects": 0}),
           flush=True)
@@ -509,8 +738,7 @@ else:
 """
 
 
-def isolated_validate(code: str, timeout=ISOLATED_PROBE_TIMEOUT,
-                      workdir=None) -> str:
+def isolated_validate(code: str, timeout=ISOLATED_PROBE_TIMEOUT, workdir=None) -> str:
     """Validate build123d code in a CHILD process (crash-safe).
 
     Returns an agent-readable string:
@@ -540,14 +768,17 @@ def isolated_validate(code: str, timeout=ISOLATED_PROBE_TIMEOUT,
 
     tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py",
-                                         delete=False,
-                                         encoding="utf-8") as tmp:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False, encoding="utf-8"
+        ) as tmp:
             tmp.write(code)
             tmp_path = tmp.name
         proc = subprocess.run(
             [sys.executable, "-c", _PROBE_RUNNER, tmp_path],
-            capture_output=True, text=True, timeout=timeout, cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=workdir,
         )
     except subprocess.TimeoutExpired:
         return (
@@ -568,21 +799,33 @@ def isolated_validate(code: str, timeout=ISOLATED_PROBE_TIMEOUT,
     try:
         for line in (proc.stdout or "").splitlines():
             if line.startswith("RESULT "):
-                result = json.loads(line[len("RESULT "):])
+                result = json.loads(line[len("RESULT ") :])
     except Exception:
         result = None
     if result is not None and proc.returncode == 0:
         if result.get("ok"):
             if result.get("warning"):
-                return ("WARNING: code ran but show_object() was never "
-                        "called. Add show_object(result).")
-            return (f"OK: code executed in an isolated process, "
-                    f"{int(result.get('objects', 0))} object(s) shown via "
-                    f"show_object().")
+                return (
+                    "WARNING: code ran but show_object() was never "
+                    "called. Add show_object(result)."
+                )
+            return (
+                f"OK: code executed in an isolated process, "
+                f"{int(result.get('objects', 0))} object(s) shown via "
+                f"show_object()."
+            )
         detail = result.get("detail", "")
         if result.get("kind") == "syntax":
             return "SyntaxError:\n" + detail
-        return "Traceback:\n" + detail
+        if result.get("kind") == "geometry":
+            return "Error: " + detail
+        return validation_failure(
+            code,
+            detail,
+            result.get("line"),
+            result.get("error", ""),
+            result.get("version", ""),
+        )
     # No RESULT line or nonzero exit: the child died natively
     # (segfault in OCCT, OOM-kill, DLL/stack fault). The app survived
     # precisely because this ran out-of-process.
@@ -595,4 +838,3 @@ def isolated_validate(code: str, timeout=ISOLATED_PROBE_TIMEOUT,
         f"Simplify the model (fewer/looser features, avoid tiny fillets, "
         f"split into smaller parts) and retry."
     )
-

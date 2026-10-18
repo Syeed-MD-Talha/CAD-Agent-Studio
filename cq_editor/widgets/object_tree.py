@@ -114,7 +114,7 @@ class CQRootItem(TopTreeItem):
 
     def __init__(self, *args, **kwargs):
 
-        super(CQRootItem, self).__init__(["CQ models"], *args, **kwargs)
+        super(CQRootItem, self).__init__(["Models"], *args, **kwargs)
 
 
 class HelpersRootItem(TopTreeItem):
@@ -155,8 +155,12 @@ class ObjectTree(QWidget, ComponentMixin):
             self, selectionMode=QAbstractItemView.ExtendedSelection
         )
         self.properties_editor = ParameterTree(self)
+        self.properties_editor.setHeaderHidden(True)
 
         tree.setHeaderHidden(True)
+        tree.setIndentation(18)
+        tree.setUniformRowHeights(True)
+        tree.setAnimated(True)
         tree.setItemsExpandable(True)
         tree.setRootIsDecorated(False)
         tree.setContextMenuPolicy(Qt.ActionsContextMenu)
@@ -259,6 +263,7 @@ class ObjectTree(QWidget, ComponentMixin):
         layout(self, (self._splitter,), top_widget=self)
 
         self._splitter.show()
+        self.properties_editor.hide()
 
     def showMenu(self, position):
 
@@ -362,9 +367,7 @@ class ObjectTree(QWidget, ComponentMixin):
                 node_label, shape=None, ais=None, sig=self.sigObjectPropertiesChanged
             )
             for i, child in enumerate(children):
-                child_label = (
-                    getattr(child, "label", "") or f"{node_label}.{i}"
-                )
+                child_label = getattr(child, "label", "") or f"{node_label}.{i}"
                 item.addChild(
                     self._build_assembly_item(
                         child, child_label, options, world, color, ais_list
@@ -410,9 +413,10 @@ class ObjectTree(QWidget, ComponentMixin):
         """
         # Explode build123d assemblies (Compounds with children) into
         # one item per part.
-        if self._has_assembly_children(shape) and not self.preferences[
-            "Merge Assemblies"
-        ]:
+        if (
+            self._has_assembly_children(shape)
+            and not self.preferences["Merge Assemblies"]
+        ):
             ais_list = []
             top_label = name or getattr(shape, "label", "") or "assembly"
             item = self._build_assembly_item(
@@ -546,6 +550,16 @@ class ObjectTree(QWidget, ComponentMixin):
 
     def export(self, export_type, precision=None):
 
+        owner = self
+        while owner is not None and not isinstance(
+            getattr(owner, "components", None), dict
+        ):
+            owner = owner.parent()
+        chat = owner.components.get("chat") if owner is not None else None
+        if chat and (chat.worker is not None or chat._operation_active):
+            chat.status.setText("Stop the running operation before exporting.")
+            return
+
         items = self.tree.selectedItems()
 
         # If the CQ root is selected, take all top-level objects
@@ -565,15 +579,25 @@ class ObjectTree(QWidget, ComponentMixin):
 
         fname = get_save_filename(export_type)
         if fname != "":
-            export(shapes, export_type, fname, precision)
+            if chat:
+                chat._stop_requested = False
+                output = chat.export_model(
+                    export_type, fname, shapes=shapes, precision=precision
+                )
+                chat._append("Export verification", output)
+                chat._set_busy(False, output.splitlines()[0])
+            else:
+                export(shapes, export_type, fname, precision)
 
     @pyqtSlot()
     def handleSelection(self):
 
         items = self.tree.selectedItems()
         if len(items) == 0:
+            self.sigAISObjectsSelected.emit([])
             self._export_STL_action.setEnabled(False)
             self._export_STEP_action.setEnabled(False)
+            self.properties_editor.hide()
             return
 
         # emit list of all selected ais objects (might be empty)
@@ -597,15 +621,18 @@ class ObjectTree(QWidget, ComponentMixin):
                 self.sigCQObjectSelected.emit(item.shape)
             self.properties_editor.setParameters(item.properties, showTop=False)
             self.properties_editor.setEnabled(True)
+            self.properties_editor.show()
         elif item is self.CQ and item.childCount() > 0:
             self._export_STL_action.setEnabled(True)
             self._export_STEP_action.setEnabled(True)
+            self.properties_editor.hide()
         else:
             self._export_STL_action.setEnabled(False)
             self._export_STEP_action.setEnabled(False)
             self._clear_current_action.setEnabled(False)
             self.properties_editor.setEnabled(False)
             self.properties_editor.clear()
+            self.properties_editor.hide()
 
     @pyqtSlot(list)
     def handleGraphicalSelection(self, shapes):

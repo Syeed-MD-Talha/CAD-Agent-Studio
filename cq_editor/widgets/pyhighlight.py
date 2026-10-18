@@ -120,43 +120,59 @@ class PythonHighlighter(QSyntaxHighlighter):
     def __init__(self, parent=None):
         super(PythonHighlighter, self).__init__(parent)
 
+        self.set_theme(False)
+
+    def set_theme(self, dark=False):
+        styles = {
+            "keyword": format("#c4a5ff" if dark else "#7041c4"),
+            "operator": format("#99b0cf" if dark else "#526580"),
+            "brace": format("#c3d0e3" if dark else "#526580"),
+            "defclass": format("#8dc9ff" if dark else "#1559a1", "bold"),
+            "string": format("#a7dca0" if dark else "#237348"),
+            "string2": format("#a7dca0" if dark else "#237348"),
+            "comment": format("#8498b4" if dark else "#7a8699", "italic"),
+            "self": format("#c4a5ff" if dark else "#7041c4"),
+            "numbers": format("#f6bd8b" if dark else "#b35627"),
+        }
         # Multi-line strings (expression, flag, style)
-        self.tri_single = (QRegExp("'''"), 1, STYLES["string2"])
-        self.tri_double = (QRegExp('"""'), 2, STYLES["string2"])
+        self.tri_single = (QRegExp("'''"), 1, styles["string2"])
+        self.tri_double = (QRegExp('"""'), 2, styles["string2"])
 
         rules = []
 
         # Keyword, operator, and brace rules
         rules += [
-            (r"\b%s\b" % w, 0, STYLES["keyword"]) for w in PythonHighlighter.keywords
+            (r"\b%s\b" % w, 0, styles["keyword"]) for w in PythonHighlighter.keywords
         ]
         rules += [
-            (r"%s" % o, 0, STYLES["operator"]) for o in PythonHighlighter.operators
+            (r"%s" % o, 0, styles["operator"]) for o in PythonHighlighter.operators
         ]
-        rules += [(r"%s" % b, 0, STYLES["brace"]) for b in PythonHighlighter.braces]
+        rules += [(r"%s" % b, 0, styles["brace"]) for b in PythonHighlighter.braces]
 
         # All other rules
         rules += [
             # 'self'
-            (r"\bself\b", 0, STYLES["self"]),
+            (r"\bself\b", 0, styles["self"]),
             # 'def' followed by an identifier
-            (r"\bdef\b\s*(\w+)", 1, STYLES["defclass"]),
+            (r"\bdef\b\s*(\w+)", 1, styles["defclass"]),
             # 'class' followed by an identifier
-            (r"\bclass\b\s*(\w+)", 1, STYLES["defclass"]),
+            (r"\bclass\b\s*(\w+)", 1, styles["defclass"]),
             # Numeric literals
-            (r"\b[+-]?[0-9]+[lL]?\b", 0, STYLES["numbers"]),
-            (r"\b[+-]?0[xX][0-9A-Fa-f]+[lL]?\b", 0, STYLES["numbers"]),
-            (r"\b[+-]?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\b", 0, STYLES["numbers"]),
+            (r"\b[+-]?[0-9]+[lL]?\b", 0, styles["numbers"]),
+            (r"\b[+-]?0[xX][0-9A-Fa-f]+[lL]?\b", 0, styles["numbers"]),
+            (r"\b[+-]?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\b", 0, styles["numbers"]),
             # Double-quoted string, possibly containing escape sequences
-            (r'"[^"\\]*(\\.[^"\\]*)*"', 0, STYLES["string"]),
+            (r'"[^"\\]*(\\.[^"\\]*)*"', 0, styles["string"]),
             # Single-quoted string, possibly containing escape sequences
-            (r"'[^'\\]*(\\.[^'\\]*)*'", 0, STYLES["string"]),
+            (r"'[^'\\]*(\\.[^'\\]*)*'", 0, styles["string"]),
             # From '#' until a newline
-            (r"#[^\n]*", 0, STYLES["comment"]),
+            (r"#[^\n]*", 0, styles["comment"]),
         ]
 
         # Build a QRegExp for each pattern
         self.rules = [(QRegExp(pat), index, fmt) for (pat, index, fmt) in rules]
+
+        self.rehighlight()
 
     def highlightBlock(self, text):
         """

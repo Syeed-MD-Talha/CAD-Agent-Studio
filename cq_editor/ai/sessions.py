@@ -84,8 +84,7 @@ def autotitle(messages, limit=42):
             for message in messages or []:
                 content = message.get("content")
                 if isinstance(content, list) and any(
-                    isinstance(b, dict) and b.get("type") == "image"
-                    for b in content
+                    isinstance(b, dict) and b.get("type") == "image" for b in content
                 ):
                     return "Reference images"
         except Exception:
@@ -193,8 +192,16 @@ class SessionStore:
             pass
         return None, None
 
-    def save_session(self, session_id, messages, title=None, model="", usage=None,
-                     design_code=None):
+    def save_session(
+        self,
+        session_id,
+        messages,
+        title=None,
+        model="",
+        usage=None,
+        design_code=None,
+        requirements=None,
+    ):
         try:
             path = self.base / f"{session_id}.json"
             try:
@@ -206,10 +213,14 @@ class SessionStore:
             if model:
                 payload["model"] = model
             if usage is not None:
-                payload["usage"] = {"in": int(usage.get("in", 0)),
-                                    "out": int(usage.get("out", 0))}
+                payload["usage"] = {
+                    "in": int(usage.get("in", 0)),
+                    "out": int(usage.get("out", 0)),
+                }
             if design_code is not None:
                 payload["design_code"] = design_code
+            if requirements is not None:
+                payload["requirements"] = requirements
             if title is not None:
                 payload["title"] = title
             elif not payload.get("title"):
@@ -247,6 +258,4 @@ class SessionStore:
             (self.base / f"{session_id}.json").unlink()
         except Exception:
             pass
-        self._write_index(
-            [e for e in self._read_index() if e.get("id") != session_id]
-        )
+        self._write_index([e for e in self._read_index() if e.get("id") != session_id])

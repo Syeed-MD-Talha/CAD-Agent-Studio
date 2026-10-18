@@ -36,6 +36,9 @@ classifiers = [
 CQ-editor = "cq_editor.cqe_run:main"
 cq-editor = "cq_editor.cqe_run:main"
 
+[tool.setuptools.package-data]
+"cq_editor.ai" = ["skills/*/SKILL.md"]
+
 [project.optional-dependencies]
 ai = [
     "anthropic>=0.25.0",
@@ -54,5 +57,5 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/CadQuery/CQ-editor.git"
-"Bug Tracker" = "https://github.com/CadQuery/CQ-editor/issues"
+Repository = "https://github.com/Syeed-MD-Talha/cq-build123d-editor"
+"Bug Tracker" = "https://github.com/Syeed-MD-Talha/cq-build123d-editor/issues"

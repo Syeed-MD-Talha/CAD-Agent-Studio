@@ -4,7 +4,7 @@ import tempfile
 
 import requests
 from PyQt5.QtGui import QDesktopServices
-from PyQt5.QtCore import QRunnable, QThreadPool, pyqtSignal, QObject
+from PyQt5.QtCore import QRunnable, QThreadPool, pyqtSignal, QObject, Qt
 from PyQt5.QtWidgets import (
     QComboBox,
     QDialog,
@@ -16,6 +16,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
 )
 from ..cq_utils import export
+from ..theme import theme_for, dialog_styles
 
 PRESETS = [
     {
@@ -56,6 +57,10 @@ class _UploadRunnable(QRunnable):
 class UploadDialog(QDialog):
     def __init__(self, parent, object_tree, editor, selected_shapes=None):
         super().__init__(parent, windowTitle="Upload Model")
+        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        self.setStyleSheet(
+            dialog_styles(theme_for(parent.preferences["Light/Dark Theme"] == "Dark"))
+        )
         self._object_tree = object_tree
         self._editor = editor
         self._active_preset = None
@@ -86,6 +91,7 @@ class UploadDialog(QDialog):
 
         # Upload button
         self._upload_btn = QPushButton("Upload")
+        self._upload_btn.setObjectName("primaryAction")
         self._upload_btn.clicked.connect(self._do_upload)
 
         # Response area
@@ -94,13 +100,24 @@ class UploadDialog(QDialog):
         self._response.anchorClicked.connect(lambda url: QDesktopServices.openUrl(url))
 
         layout = QVBoxLayout()
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(16)
+        heading = QLabel("Send your design")
+        heading.setObjectName("dialogHeading")
+        description = QLabel(
+            "Choose a destination and file format to upload your current model."
+        )
+        description.setObjectName("dialogDescription")
+        description.setWordWrap(True)
+        layout.addWidget(heading)
+        layout.addWidget(description)
         layout.addLayout(url_layout)
         layout.addLayout(preset_layout)
         layout.addLayout(type_layout)
         layout.addWidget(self._upload_btn)
         layout.addWidget(self._response)
         self.setLayout(layout)
-        self.resize(500, 400)
+        self.resize(600, 520)
 
     def _apply_preset(self, preset):
         self._url_input.setText(preset["url"])

@@ -4,7 +4,7 @@ import argparse
 
 from PyQt5.QtWidgets import QApplication
 
-NAME = "CQ-editor"
+NAME = "CAD Agent Studio"
 
 # Reorder QT_QPA_PLATFORM so Qt reaches a Wayland plugin only after everything
 # else has failed to load, defaulting to xcb. OCCT does not yet support Wayland.

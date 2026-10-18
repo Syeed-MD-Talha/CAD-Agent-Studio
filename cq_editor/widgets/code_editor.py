@@ -3,6 +3,7 @@
 import os
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtGui import QPalette, QColor
+from ..theme import theme_for, palette_for
 
 DARK_BLUE = QtGui.QColor(118, 150, 185)
 
@@ -10,6 +11,7 @@ DARK_BLUE = QtGui.QColor(118, 150, 185)
 class SearchWidget(QtWidgets.QWidget):
     def __init__(self, editor):
         super(SearchWidget, self).__init__(editor)
+        self.setObjectName("editorSearch")
         self.editor = editor
         self.current_match = 0
         self.total_matches = 0
@@ -32,12 +34,14 @@ class SearchWidget(QtWidgets.QWidget):
         self.search_input.returnPressed.connect(self.find_next)
 
         # Previous button
-        self.prev_button = QtWidgets.QPushButton("Prev")
+        self.prev_button = QtWidgets.QPushButton("↑")
+        self.prev_button.setToolTip("Previous match · Alt+F3")
         self.prev_button.clicked.connect(self.find_previous)
         self.prev_button.setEnabled(False)
 
         # Next button
-        self.next_button = QtWidgets.QPushButton("Next")
+        self.next_button = QtWidgets.QPushButton("↓")
+        self.next_button.setToolTip("Next match · F3")
         self.next_button.clicked.connect(self.find_next)
         self.next_button.setEnabled(False)
 
@@ -46,7 +50,8 @@ class SearchWidget(QtWidgets.QWidget):
 
         # Close button
         self.close_button = QtWidgets.QPushButton("×")
-        self.close_button.setMaximumSize(20, 20)
+        self.close_button.setFixedSize(26, 26)
+        self.close_button.setToolTip("Close search · Esc")
         self.close_button.clicked.connect(self.hide_search)
 
         # Add widgets to layout
@@ -226,9 +231,9 @@ class SearchWidget(QtWidgets.QWidget):
 
         # Top-right corner of the editor
         editor_rect = self.editor.geometry()
-        widget_width = 400
-        widget_height = 40
-        x = editor_rect.width() - widget_width - 20
+        widget_width = max(260, min(460, editor_rect.width() - 24))
+        widget_height = 46
+        x = max(6, editor_rect.width() - widget_width - 12)
         y = 10
 
         # Set the size of the widget and bring it to the front
@@ -441,7 +446,8 @@ class CodeEditor(CodeTextEdit):
         self.line_number_area = LineNumberArea(self)
 
         self.font = QtGui.QFont()
-        self.font.setFamily("Courier New")
+        families = QtGui.QFontDatabase().families()
+        self.font.setFamily("Consolas" if "Consolas" in families else "Courier New")
         self.font.setStyleHint(QtGui.QFont.Monospace)
         self.font.setPointSize(10)
         self.setFont(self.font)
@@ -451,7 +457,7 @@ class CodeEditor(CodeTextEdit):
 
         self.blockCountChanged.connect(self.update_line_number_area_width)
         self.updateRequest.connect(self.update_line_number_area)
-        # self.cursorPositionChanged.connect(self.highlight_current_line)
+        self.cursorPositionChanged.connect(self.highlight_current_line)
 
         self.update_line_number_area_width(0)
         # self.highlight_current_line()
@@ -500,7 +506,7 @@ class CodeEditor(CodeTextEdit):
         language="Python",
         filename="",
     ):
-        print("setup_editor called")
+        pass
 
     def set_color_scheme(self, color_scheme):
         """
@@ -508,29 +514,31 @@ class CodeEditor(CodeTextEdit):
         :param str color_scheme: Name of the color theme to be set
         """
 
-        if color_scheme == "Light":
-            self.setStyleSheet("")
-            self.setPalette(QtWidgets.QApplication.style().standardPalette())
-        else:
-            # Now use a palette to switch to dark colors:
-            white_color = QColor(255, 255, 255)
-            black_color = QColor(0, 0, 0)
-            red_color = QColor(255, 0, 0)
-            palette = QPalette()
-            palette.setColor(QPalette.Window, QColor(53, 53, 53))
-            palette.setColor(QPalette.WindowText, white_color)
-            palette.setColor(QPalette.Base, QColor(25, 25, 25))
-            palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
-            palette.setColor(QPalette.ToolTipBase, black_color)
-            palette.setColor(QPalette.ToolTipText, white_color)
-            palette.setColor(QPalette.Text, white_color)
-            palette.setColor(QPalette.Button, QColor(53, 53, 53))
-            palette.setColor(QPalette.ButtonText, white_color)
-            palette.setColor(QPalette.BrightText, red_color)
-            palette.setColor(QPalette.Link, QColor(42, 130, 218))
-            palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
-            palette.setColor(QPalette.HighlightedText, black_color)
-            self.setPalette(palette)
+        dark = (
+            QtWidgets.QApplication.palette().color(QPalette.Window).lightness() < 128
+            if color_scheme == "Follow app"
+            else color_scheme == "Dark"
+        )
+        colors = theme_for(dark)
+        self._editor_theme = colors
+        self.setObjectName("codeEditor")
+        self.setPalette(palette_for(colors))
+        self.setStyleSheet(
+            f"QPlainTextEdit#codeEditor {{ background: {colors.surface}; color: {colors.text}; "
+            f"border: none; selection-background-color: {colors.selection}; selection-color: {colors.text}; }}"
+        )
+        self.setFrameStyle(0)
+        if hasattr(self, "highlighter"):
+            self.highlighter.set_theme(dark)
+        self.search_widget.setStyleSheet(f"""
+            #editorSearch {{ background: {colors.surface}; border: 1px solid {colors.border}; border-radius: 8px; }}
+            QLineEdit {{ background: {colors.surface}; color: {colors.text}; border: none; padding: 4px; }}
+            QLabel {{ color: {colors.muted}; font-size: 10px; }}
+            QPushButton {{ background: transparent; color: {colors.text}; border: none; border-radius: 4px; padding: 3px; }}
+            QPushButton:hover {{ background: {colors.selection}; }}
+        """)
+        self.line_number_area.update()
+        self.highlight_current_line()
 
     def set_font(self, new_font):
         self.font = new_font
@@ -779,7 +787,8 @@ class CodeEditor(CodeTextEdit):
     def lineNumberAreaPaintEvent(self, event):
         painter = QtGui.QPainter(self.line_number_area)
         try:
-            # painter.fillRect(event.rect(), QtCore.Qt.lightGray)
+            colors = getattr(self, "_editor_theme", theme_for(False))
+            painter.fillRect(event.rect(), QtGui.QColor(colors.window))
             block = self.firstVisibleBlock()
             block_number = block.blockNumber()
             offset = self.contentOffset()
@@ -822,7 +831,7 @@ class CodeEditor(CodeTextEdit):
 
                     # Draw the line number
                     number = str(line_number)
-                    painter.setPen(DARK_BLUE)
+                    painter.setPen(QtGui.QColor(colors.muted))
                     width = self.line_number_area.width() - 10
                     height = self.fontMetrics().height()
                     painter.drawText(
@@ -850,10 +859,14 @@ class CodeEditor(CodeTextEdit):
             self.update_line_number_area_width(0)
 
     def highlight_current_line(self):
+        if hasattr(self, "search_widget") and self.search_widget.isVisible():
+            return
         extra_selections = list()
         if not self.isReadOnly():
             selection = QtWidgets.QTextEdit.ExtraSelection()
-            line_color = DARK_BLUE.lighter(160)
+            line_color = QtGui.QColor(
+                getattr(self, "_editor_theme", theme_for(False)).subtle
+            )
             selection.format.setBackground(line_color)
             selection.format.setProperty(QtGui.QTextFormat.FullWidthSelection, True)
 

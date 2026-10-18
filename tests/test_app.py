@@ -2047,14 +2047,10 @@ res = math.""")
     qtbot.keyClick(editor.completion_list, Qt.Key_Return)
     qtbot.wait(250)
     # Check that a completion was applied (text grew past the "math." prefix)
-    assert editor.get_text_with_eol().startswith(
-        """import math
-res = math."""
-    )
-    assert len(editor.get_text_with_eol()) > len(
-        """import math
-res = math."""
-    )
+    assert editor.get_text_with_eol().startswith("""import math
+res = math.""")
+    assert len(editor.get_text_with_eol()) > len("""import math
+res = math.""")
 
     # Reset for the next test
     editor.set_text(r"""import math
@@ -2075,12 +2071,8 @@ res = math.sqrt(""")
     qtbot.wait(250)
 
     # Check that the signature was completed
-    assert (
-        editor.get_text_with_eol().startswith(
-            """import math
-res = math.sqrt("""
-        )
-    )
+    assert editor.get_text_with_eol().startswith("""import math
+res = math.sqrt(""")
 
     # Reset for the next test
     editor.set_text(r"""import math

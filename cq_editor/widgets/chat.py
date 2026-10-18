@@ -16,8 +16,16 @@ import traceback as tb
 from datetime import datetime
 from pathlib import Path
 
-from PyQt5.QtCore import Qt, QThread, QTimer, QStringListModel, QSettings, pyqtSignal, pyqtSlot
-from PyQt5.QtGui import QIcon, QImage, QPixmap
+from PyQt5.QtCore import (
+    Qt,
+    QThread,
+    QTimer,
+    QStringListModel,
+    QSettings,
+    pyqtSignal,
+    pyqtSlot,
+)
+from PyQt5.QtGui import QIcon, QImage, QPixmap, QKeySequence
 from PyQt5.QtWidgets import (
     QWidget,
     QTextBrowser,
@@ -36,10 +44,6 @@ from PyQt5.QtWidgets import (
     QFrame,
     QFileDialog,
     QMessageBox,
-    QDialog,
-    QDialogButtonBox,
-    QFormLayout,
-    QLineEdit,
     QSizePolicy,
     QApplication,
 )
@@ -67,11 +71,17 @@ from ..ai.cad_agent import (
     headless_validate,
     isolated_validate,
     ISOLATED_PROBE_TIMEOUT,
+    build_system_prompt,
 )
+from ..ai.skill_store import SkillStore
 from ..ai.subagent import run_subagent, run_code_subagent
 from ..ai.sessions import SessionStore, autotitle, DEFAULT_TITLE, is_auto_title
-from ..ai.providers import PROVIDERS, ProviderConfig, ProviderSettings, load_environment
-
+from ..ai.providers import PROVIDERS, ProviderSettings, load_environment
+from .provider_settings import ProviderSettingsDialog, ProviderComboBox
+from .controls import CheckBox, ElidedLabel
+from .verification import VerificationPanel
+from ..ai.verification import normalize_requirements, report_text
+from ..theme import theme_for
 
 # Legacy starter snippet (kept for backward compatibility / tests).
 # NOTE: new sessions no longer insert this — every fresh chat starts with
@@ -79,9 +89,7 @@ from ..ai.providers import PROVIDERS, ProviderConfig, ProviderSettings, load_env
 # auto-rendered). The user (or the agent via apply_and_render) explicitly
 # creates the first design.
 STARTER_CODE = (
-    "from build123d import *\n"
-    "result = Box(3, 3, 0.5)\n"
-    "show_object(result)"
+    "from build123d import *\n" "result = Box(3, 3, 0.5)\n" "show_object(result)"
 )
 
 # What a brand-new / design-less session shows: truly empty.
@@ -98,6 +106,7 @@ SLASH_COMMANDS = {
     "/undo": "Restore editor code from before the last apply",
     "/export": "Save this chat as a Markdown transcript",
     "/examples": "List bundled build123d examples",
+    "/skills": "List CAD skills, or read one: /skills [name] [draft]",
     "/compact": "Show what auto-compaction sends vs stores",
     "/model": "Show the selected provider and model",
     "/effort": "Show or set reasoning effort: /effort [low|medium|high|max]",
@@ -110,9 +119,20 @@ class LLMWorker(QThread):
 
     finished_ok = pyqtSignal(object)  # Anthropic response
     finished_err = pyqtSignal(str)
+    status_changed = pyqtSignal(str)
 
-    def __init__(self, client, model, messages, parent=None, thinking=None,
-                 max_tokens=8000):
+    def __init__(
+        self,
+        client,
+        model,
+        messages,
+        parent=None,
+        thinking=None,
+        max_tokens=8000,
+        tools=None,
+        skills=None,
+        learning=True,
+    ):
         super().__init__(parent)
         self.client = client
         self.model = model
@@ -120,30 +140,32 @@ class LLMWorker(QThread):
         self.messages = list(messages)
         self.thinking = thinking
         self.max_tokens = max_tokens
+        self.tools = TOOLS if tools is None else tools
+        self.skills = skills
+        self.learning = learning
 
     def run(self):
         try:
-            kwargs = {}
-            if self.thinking is not None:
-                kwargs["thinking"] = self.thinking
-            resp = self.client.messages.create(
+            from ..ai.cad_agent import SYSTEM_PROMPT, TOOLS
+            from ..ai.recovery import complete
+
+            resp = complete(
+                self.client,
                 model=self.model,
-                system=__import__(
-                    "cq_editor.ai.cad_agent", fromlist=["SYSTEM_PROMPT"]
-                ).SYSTEM_PROMPT,
+                system=build_system_prompt(self.skills, learning=self.learning),
                 messages=self.messages,
-                tools=__import__(
-                    "cq_editor.ai.cad_agent", fromlist=["TOOLS"]
-                ).TOOLS,
+                tools=self.tools,
                 max_tokens=self.max_tokens,
-                **kwargs,
+                thinking=self.thinking,
+                on_status=self.status_changed.emit,
+                cancelled=self.isInterruptionRequested,
             )
             self.finished_ok.emit(resp)
         except Exception as e:
             self.finished_err.emit(f"{type(e).__name__}: {e}")
 
 
-class StreamWorker(QThread):
+class StreamWorker(LLMWorker):
     """Streaming LLM turn: emits text AND thinking deltas live, then final.
 
     Uses client.messages.stream() so the chat shows tokens as they arrive.
@@ -155,58 +177,29 @@ class StreamWorker(QThread):
 
     text_delta = pyqtSignal(str)
     thinking_delta = pyqtSignal(str)
-    finished_ok = pyqtSignal(object)  # final message (has .content blocks)
-    finished_err = pyqtSignal(str)
-
-    def __init__(self, client, model, messages, parent=None, thinking=None,
-                 max_tokens=8000):
-        super().__init__(parent)
-        self.client = client
-        self.model = model
-        self.messages = list(messages)
-        self.thinking = thinking
-        self.max_tokens = max_tokens
+    stream_reset = pyqtSignal()
 
     def run(self):
         try:
             from cq_editor.ai.cad_agent import SYSTEM_PROMPT, TOOLS
+            from ..ai.recovery import complete
 
-            kwargs = {}
-            if self.thinking is not None:
-                kwargs["thinking"] = self.thinking
-            try:
-                with self.client.messages.stream(
-                    model=self.model,
-                    system=SYSTEM_PROMPT,
-                    messages=self.messages,
-                    tools=TOOLS,
-                    max_tokens=self.max_tokens,
-                    **kwargs,
-                ) as stream:
-                    for event in stream:
-                        etype = getattr(event, "type", "")
-                        if etype == "text":
-                            self.text_delta.emit(event.text)
-                        elif etype == "thinking":
-                            self.thinking_delta.emit(event.thinking)
-                    final = stream.get_final_message()
-                self.finished_ok.emit(final)
-            except Exception as stream_err:
-                # Fallback for gateways without .stream support.
-                if "stream" in type(stream_err).__name__.lower() or "stream" in str(
-                    stream_err
-                ).lower() or "no attribute" in str(stream_err).lower():
-                    resp = self.client.messages.create(
-                        model=self.model,
-                        system=SYSTEM_PROMPT,
-                        messages=self.messages,
-                        tools=TOOLS,
-                        max_tokens=self.max_tokens,
-                        **kwargs,
-                    )
-                    self.finished_ok.emit(resp)
-                else:
-                    raise
+            final = complete(
+                self.client,
+                model=self.model,
+                system=build_system_prompt(self.skills, learning=self.learning),
+                messages=self.messages,
+                tools=self.tools,
+                max_tokens=self.max_tokens,
+                thinking=self.thinking,
+                stream=True,
+                on_text=self.text_delta.emit,
+                on_thinking=self.thinking_delta.emit,
+                on_reset=self.stream_reset.emit,
+                on_status=self.status_changed.emit,
+                cancelled=self.isInterruptionRequested,
+            )
+            self.finished_ok.emit(final)
         except Exception as e:
             self.finished_err.emit(f"{type(e).__name__}: {e}")
 
@@ -217,25 +210,48 @@ class ChatWidget(QWidget, ComponentMixin):
     preferences = Parameter.create(
         name="Preferences",
         children=[
-            {"name": "Max tool iterations", "type": "int", "value": 6, "limits": (1, 20)},
+            {
+                "name": "Max tool iterations",
+                "type": "int",
+                "value": 6,
+                "limits": (1, 20),
+            },
             {"name": "Auto-apply code", "type": "bool", "value": True},
-            {"name": "Isolated pre-render", "type": "bool", "value": True},
-            {"name": "Pre-render timeout (s)", "type": "int", "value": 180, "limits": (10, 1800)},
+            {"name": "Learn reusable CAD skills", "type": "bool", "value": True},
+            {
+                "name": "Pre-render timeout (s)",
+                "type": "int",
+                "value": 180,
+                "limits": (10, 1800),
+            },
         ],
     )
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.preferences = Parameter.create(**type(self).preferences.saveState())
         ComponentMixin.__init__(self)
 
         self.messages = []  # Anthropic conversation history
         self.last_code = ""
         self.worker = None
+        self._active_workers = []
+        self._operation_active = False
+        self._validated_job = None
+        self._requirements_recorded_this_turn = False
+        self.design_requirements = []
+        self.verification_report = None
+        self._verification_code = None
+        self._visual_capture_revision = None
         self.iters_left = 0
+        self._finalizing = False
+        self._stop_requested = False
+        self._request_rendered = False
         self._pending_traceback = None
         self._stream_buf = ""
         self._think_buf = ""
         self._stream_active = False
+        self._stream_start_pos = None
         self._doc_parts = []  # full history HTML; view rebuilt from it
         self._code_snippets = []  # code blocks for [Copy] anchors, in doc order
         self.pending_images = []  # [{name, bytes(JPEG), w, h}] attached, not yet sent
@@ -253,6 +269,7 @@ class ChatWidget(QWidget, ComponentMixin):
         self._stream_dirty = False
         # Sessions (s08-transcript + s09-store style, see ai/sessions.py).
         self._store = SessionStore()
+        self._skills = SkillStore()
         self.session_id = None
         self.session_title = DEFAULT_TITLE
         self._loading_combo = False
@@ -312,63 +329,84 @@ class ChatWidget(QWidget, ComponentMixin):
         # header
         header = QFrame(self)
         header.setObjectName("chatHeader")
-        hlay = QHBoxLayout(header)
-        hlay.setContentsMargins(12, 10, 8, 10)
+        header_layout = QVBoxLayout(header)
+        header_layout.setContentsMargins(12, 12, 12, 12)
+        header_layout.setSpacing(12)
+        hlay = QHBoxLayout()
+        hlay.setContentsMargins(0, 0, 0, 0)
         hlay.setSpacing(10)
         self.title_icon = QLabel(header)
         self.title_icon.setObjectName("brandIcon")
-        if _HAS_QTA:
-            try:
-                self.title_icon.setPixmap(
-                    qta.icon("fa5s.cube", color="#2563eb").pixmap(26, 26)
-                )
-            except Exception:
-                self.title_icon.setText("◈")
-        else:
-            self.title_icon.setText("◈")
+        self.title_icon.setPixmap(
+            QPixmap(":/images/icons/cad_studio_mark.png").scaled(
+                26, 26, Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+        )
         title_box = QVBoxLayout()
         title_box.setSpacing(0)
         title_box.setContentsMargins(0, 0, 0, 0)
         self.title_label = QLabel("CAD Assistant", header)
         self.title_label.setObjectName("chatTitle")
-        self.subtitle_label = QLabel("AI part designer · build123d", header)
+        self.subtitle_label = QLabel("Describe. Refine. Create.", header)
         self.subtitle_label.setObjectName("chatSubtitle")
         title_box.addWidget(self.title_label)
         title_box.addWidget(self.subtitle_label)
-        self.provider_pill = QLabel("● Fireworks", header)
-        self.provider_pill.setObjectName("providerPill")
-        self.provider_pill.setToolTip("Active AI provider")
-        self.provider_combo = QComboBox(header)
-        self.provider_combo.setToolTip("Choose the AI provider used for the next request.")
-        for provider_id, spec in PROVIDERS.items():
-            self.provider_combo.addItem(spec.label, provider_id)
-        selected_index = self.provider_combo.findData(self._provider_settings.selected())
-        self.provider_combo.setCurrentIndex(max(0, selected_index))
-        self.api_settings_btn = QPushButton("Provider settings", header)
-        self.api_settings_btn.setObjectName("expBtn")
-        self.api_settings_btn.setToolTip("Set this provider's API key, model, and base URL.")
         self.mode_pill = QLabel("PLAN", header)
         self.mode_pill.setObjectName("modePill")
-        self.mode_pill.setToolTip("Plan mode: code is validated, never auto-applied (/plan to toggle)")
+        self.mode_pill.setToolTip(
+            "Plan mode: code is validated, never auto-applied (/plan to toggle)"
+        )
         self.mode_pill.setVisible(False)
         hlay.addWidget(self.title_icon)
         hlay.addLayout(title_box, 1)
         hlay.addWidget(self.mode_pill)
-        hlay.addWidget(self.provider_pill)
-        hlay.addWidget(self.provider_combo)
-        hlay.addWidget(self.api_settings_btn)
+        self.chats_btn = QPushButton("Chats", header)
+        self.chats_btn.setObjectName("iconBtn")
+        self.chats_btn.setCheckable(True)
+        self.chats_btn.setToolTip("Show saved conversations")
+        self.chats_btn.setCursor(Qt.PointingHandCursor)
+        self.chats_btn.toggled.connect(self.sidebar.setVisible)
+        hlay.addWidget(self.chats_btn)
+        self.provider_control = QFrame(header)
+        self.provider_control.setObjectName("providerControl")
+        provider_row = QHBoxLayout(self.provider_control)
+        provider_row.setContentsMargins(2, 2, 2, 2)
+        provider_row.setSpacing(2)
+        self.provider_combo = ProviderComboBox(self.provider_control)
+        self.provider_combo.setObjectName("providerSelect")
+        self.provider_combo.setAccessibleName("AI provider")
+        self.provider_combo.setMinimumWidth(145)
+        self.provider_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        for provider_id, spec in PROVIDERS.items():
+            self.provider_combo.addItem(spec.label, provider_id)
+        self.provider_combo.setCurrentIndex(
+            self.provider_combo.findData(self._provider_settings.selected())
+        )
+        provider_row.addWidget(self.provider_combo, 1)
+        divider = QFrame(self.provider_control)
+        divider.setObjectName("providerDivider")
+        divider.setFixedSize(1, 20)
+        provider_row.addWidget(divider)
+        self.api_settings_btn = QPushButton("Settings", self.provider_control)
+        self.api_settings_btn.setObjectName("providerSettingsBtn")
+        self.api_settings_btn.setToolTip("Manage this provider's API key and model")
+        self.api_settings_btn.setCursor(Qt.PointingHandCursor)
+        self.api_settings_btn.setFixedHeight(36)
+        provider_row.addWidget(self.api_settings_btn)
         self.clear_btn = QPushButton(header)
         self.clear_btn.setObjectName("iconBtn")
         self.clear_btn.setToolTip("Start new chat")
         self.clear_btn.setFixedSize(30, 30)
         if _HAS_QTA:
             try:
-                self.clear_btn.setIcon(qta.icon("fa5s.broom"))
+                self.clear_btn.setIcon(qta.icon("fa5s.plus", color="#2563eb"))
             except Exception:
                 self.clear_btn.setText("✕")
         else:
             self.clear_btn.setText("✕")
         hlay.addWidget(self.clear_btn)
+        header_layout.addLayout(hlay)
+        header_layout.addWidget(self.provider_control)
         chat_area.addWidget(header)
 
         # history
@@ -384,7 +422,9 @@ class ChatWidget(QWidget, ComponentMixin):
         preview_lay = QHBoxLayout(self.preview_bar)
         preview_lay.setContentsMargins(4, 4, 4, 4)
         preview_lay.setSpacing(6)
-        self.preview_hint = QLabel("Reference images — click one to remove:", self.preview_bar)
+        self.preview_hint = QLabel(
+            "Reference images — click one to remove:", self.preview_bar
+        )
         self.preview_hint.setObjectName("muted")
         preview_lay.addWidget(self.preview_hint)
         self.preview_row = QHBoxLayout()
@@ -396,7 +436,9 @@ class ChatWidget(QWidget, ComponentMixin):
         # composer
         self.attach_btn = QPushButton(self)
         self.attach_btn.setObjectName("attachBtn")
-        self.attach_btn.setToolTip("Attach reference image (PNG/JPG — max 3 per message)")
+        self.attach_btn.setToolTip(
+            "Attach or paste a reference image (Ctrl+V — max 3 per message)"
+        )
         self.attach_btn.setFixedSize(38, 38)
         if _HAS_QTA:
             try:
@@ -408,7 +450,7 @@ class ChatWidget(QWidget, ComponentMixin):
         self.input = QPlainTextEdit(self)
         self.input.setObjectName("chatInput")
         self.input.setPlaceholderText(
-            "Describe the 3D part you need…  (Enter to send · Shift+Enter for new line)"
+            "Describe a part…\nPaste an image with Ctrl+V · Enter sends · Shift+Enter adds a line"
         )
         self.input.setMaximumBlockCount(12)
         self.input.setFixedHeight(64)
@@ -436,7 +478,7 @@ class ChatWidget(QWidget, ComponentMixin):
         chat_area.addLayout(composer)
 
         # primary actions
-        self.apply_btn = QPushButton("Insert code + Render", self)
+        self.apply_btn = QPushButton("Insert + render", self)
         self.apply_btn.setObjectName("applyBtn")
         if _HAS_QTA:
             try:
@@ -444,7 +486,9 @@ class ChatWidget(QWidget, ComponentMixin):
             except Exception:
                 pass
         self.apply_btn.setEnabled(False)
-        self.apply_btn.setToolTip("Write the last generated code into the editor and render it.")
+        self.apply_btn.setToolTip(
+            "Write the last generated code into the editor and render it."
+        )
         self.undo_btn = QPushButton("Undo", self)
         self.undo_btn.setObjectName("expBtn")
         if _HAS_QTA:
@@ -453,7 +497,9 @@ class ChatWidget(QWidget, ComponentMixin):
             except Exception:
                 pass
         self.undo_btn.setEnabled(False)
-        self.undo_btn.setToolTip("Restore editor code from before the last apply (/undo).")
+        self.undo_btn.setToolTip(
+            "Restore editor code from before the last apply (/undo)."
+        )
         self.export_stl_btn = QPushButton("STL", self)
         self.export_stl_btn.setObjectName("expBtn")
         self.export_step_btn = QPushButton("STEP", self)
@@ -469,50 +515,68 @@ class ChatWidget(QWidget, ComponentMixin):
         chat_area.addLayout(action_row)
 
         # secondary toggles
-        self.autofix = QCheckBox("Self-fix", self)
+        self.autofix = CheckBox("Self-fix", self)
         self.autofix.setChecked(True)
-        self.autofix.setToolTip("Agentic loop: validate + feed tracebacks back to the model.")
-        self.plan_check = QCheckBox("Plan", self)
+        self.autofix.setToolTip(
+            "Automatically repair failed tools or code. Successful tools continue with this off."
+        )
+        self.plan_check = CheckBox("Plan", self)
         self.plan_check.setChecked(False)
-        self.plan_check.setToolTip("Plan mode: validate code, never auto-apply (/plan).")
-        self.stream_check = QCheckBox("Stream", self)
+        self.plan_check.setToolTip(
+            "Plan mode: validate code, never auto-apply (/plan)."
+        )
+        self.stream_check = CheckBox("Stream", self)
         self.stream_check.setChecked(True)
-        self.stream_check.setToolTip("Show tokens as they arrive (falls back if unsupported).")
-        self.vision_check = QCheckBox("Vision", self)
+        self.stream_check.setToolTip(
+            "Show tokens as they arrive (falls back if unsupported)."
+        )
+        self.vision_check = CheckBox("Vision", self)
         self.vision_check.setChecked(True)
         self.vision_check.setToolTip(
             "Visual feedback: after each successful render, send a 3D screenshot "
             "to the model so it can verify and refine the design."
         )
         self.effort = DEFAULT_EFFORT
-        self.effort_combo = QComboBox(self)
+        self.effort_combo = ProviderComboBox(self)
+        self.effort_combo.setMinimumContentsLength(6)
+        self.effort_combo.setMinimumHeight(28)
         self.effort_combo.addItems(["Low", "Medium", "High", "Max"])
         self.effort_combo.setCurrentText("Medium")
         self.effort_combo.setToolTip(self._effort_tooltip())
-        self.model_lbl = QLabel("Model: not configured", self)
+        self.model_lbl = ElidedLabel("Model: choose in API settings", self)
         self.model_lbl.setObjectName("muted")
-        self.model_lbl.setToolTip("The provider profile supplies this model ID.")
+        self.model_lbl.setToolTip("Change the model and API key in API settings.")
         toggles_row = QHBoxLayout()
-        toggles_row.setSpacing(12)
-        toggles_row.addWidget(self.model_lbl, 1)
+        toggles_row.setSpacing(10)
         toggles_row.addWidget(self.effort_combo)
         toggles_row.addWidget(self.autofix)
         toggles_row.addWidget(self.plan_check)
         toggles_row.addWidget(self.stream_check)
         toggles_row.addWidget(self.vision_check)
+        toggles_row.addStretch()
+        chat_area.addWidget(self.model_lbl)
         chat_area.addLayout(toggles_row)
+
+        self.verification = VerificationPanel(self)
+        self.verification.verify_requested.connect(self.on_verify_design)
+        self.verification.requirements_changed.connect(self._set_requirements)
+        chat_area.addWidget(self.verification)
 
         # status
         status_row = QHBoxLayout()
         status_row.setSpacing(6)
         self.status_dot = QLabel("●", self)
         self.status_dot.setObjectName("statusDot")
-        self.status = QLabel("Choose a provider and add its API key in Provider settings.", self)
+        self.status = QLabel("Choose a provider and open API settings to start.", self)
         self.status.setObjectName("statusLbl")
         self.status.setWordWrap(True)
         self.meter_lbl = QLabel("", self)
         self.meter_lbl.setObjectName("muted")
-        self.meter_lbl.setToolTip("Context estimate · last-turn tokens · session totals (/usage)")
+        self.meter_lbl.setMinimumWidth(0)
+        self.meter_lbl.setWordWrap(True)
+        self.meter_lbl.setToolTip(
+            "Context estimate · last-turn tokens · session totals (/usage)"
+        )
         status_row.addWidget(self.status_dot)
         status_row.addWidget(self.status, 1)
         status_row.addWidget(self.meter_lbl)
@@ -525,11 +589,10 @@ class ChatWidget(QWidget, ComponentMixin):
         root.addWidget(self.sidebar)
         root.addLayout(chat_area, 1)
         self.setLayout(root)
+        self.sidebar.hide()
 
         self._apply_styles()
         self._welcome()
-        self._refresh_provider_pill()
-        self._refresh_model_lbl()
 
         self.send_btn.clicked.connect(self.on_send)
         self.stop_btn.clicked.connect(self.on_stop)
@@ -545,10 +608,14 @@ class ChatWidget(QWidget, ComponentMixin):
         self.effort_combo.currentTextChanged.connect(self.on_effort_changed)
         self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
         self.api_settings_btn.clicked.connect(self._edit_provider_settings)
+        self._refresh_provider_controls()
+        self._refresh_model_lbl()
         # Slash-command completion (Claude/Codex "/" popup pattern).
         self.slash_completer = QCompleter(self)
         self.slash_completer.setModel(
-            QStringListModel([f"{cmd}  —  {desc}" for cmd, desc in SLASH_COMMANDS.items()])
+            QStringListModel(
+                [f"{cmd}  —  {desc}" for cmd, desc in SLASH_COMMANDS.items()]
+            )
         )
         self.slash_completer.setCaseSensitivity(Qt.CaseInsensitive)
         self.slash_completer.setCompletionMode(QCompleter.PopupCompletion)
@@ -633,30 +700,61 @@ class ChatWidget(QWidget, ComponentMixin):
     def _on_app_theme_changed(self, *args):
         """Re-style and rebuild bubbles so baked colors match the app theme."""
         try:
+            active, text, thinking = (
+                self._stream_active,
+                self._stream_buf,
+                self._think_buf,
+            )
+            self._stream_active = False
             self._apply_styles()
             self._render_history()
+            if active:
+                self._append_stream_start()
+                self._stream_buf, self._think_buf = text, thinking
+                self._refresh_stream_slot()
         except Exception:
             pass
 
     def _apply_styles(self):
         dark = self._app_is_dark()
-        if dark:
-            hist_bg, card, ink, muted = "#101728", "#1a2342", "#e8edf7", "#93a0b8"
-            user_bg, asst_border = "#2f6fed", "#33436b"
-            subtle = "#1a2342"
-        else:
-            hist_bg, card, ink, muted = "#eef1f6", "#ffffff", "#0f1f38", "#64748b"
-            user_bg, asst_border = "#2563eb", "#dfe5ee"
-            subtle = "#e7ecf3"
-        self.setStyleSheet(
-            f"""
+        colors = theme_for(dark)
+        hist_bg, card, ink, muted = (
+            colors.window,
+            colors.surface,
+            colors.text,
+            colors.muted,
+        )
+        asst_border, subtle = colors.border, colors.subtle
+        self.setStyleSheet(f"""
             #chatHeader {{ background: {card}; border: 1px solid {asst_border}; border-radius: 16px; }}
-            #brandIcon {{ font-size: 22px; color: #2563eb; }}
+            #brandIcon {{ font-size: 22px; color: {colors.accent}; }}
             #chatTitle {{ font-size: 15px; font-weight: 800; color: {ink}; letter-spacing: 0.2px; }}
             #chatSubtitle {{ font-size: 11px; color: {muted}; }}
-            #providerPill {{ background: #16a34a18; color: #16a34a; border: 1px solid #16a34a44;
-                             border-radius: 10px; padding: 3px 10px; font-size: 11px; font-weight: 700; }}
-            #modePill {{ background: #7c3aed18; color: #7c3aed; border: 1px solid #7c3aed55;
+            #providerControl {{ background: {subtle}; border: 1px solid {asst_border}; border-radius: 11px; }}
+            #providerDivider {{ background: {asst_border}; border: none; }}
+            #providerSelect {{ background: transparent; color: {ink}; border: none; border-radius: 8px;
+                               padding: 4px 30px 4px 10px; font-size: 12px; font-weight: 600; }}
+            #providerSelect:hover, #providerSelect:on {{ background: {card}; }}
+            #providerSelect:focus {{ border: 1px solid {colors.accent}; padding-left: 9px; }}
+            #providerSelect:disabled {{ color: {muted}; }}
+            #providerSelect::drop-down {{ border: none; width: 26px; }}
+            #providerSelect::down-arrow {{ image: none; }}
+            #providerSelect QAbstractItemView {{ background: {card}; color: {ink};
+                border: 1px solid {asst_border}; border-radius: 10px; padding: 6px;
+                outline: none; selection-background-color: {subtle}; selection-color: {ink}; }}
+            #providerSelect QAbstractItemView::item {{ min-height: 34px; padding: 2px 10px; border-radius: 6px; }}
+            #providerSettingsBtn {{ background: transparent; color: {muted}; border: none;
+                                    border-radius: 8px; padding: 4px 12px; font-size: 12px; font-weight: 600; }}
+            #providerSettingsBtn:hover {{ background: {card}; color: {colors.accent}; }}
+            #providerSettingsBtn:pressed {{ background: {colors.selection}; color: {colors.accent}; }}
+            #providerSettingsBtn:focus {{ border: 1px solid {colors.accent}; }}
+            #providerSettingsBtn:disabled {{ color: {muted}; }}
+            QComboBox {{ background: {card}; color: {ink}; border: 1px solid {asst_border};
+                        border-radius: 7px; padding: 5px 24px 5px 8px; font-size: 11px; }}
+            QComboBox:hover, QComboBox:focus {{ border-color: {colors.accent}; }}
+            QComboBox::drop-down {{ border: none; width: 20px; }}
+            QComboBox::down-arrow {{ image: none; }}
+            #modePill {{ background: {colors.selection}; color: {colors.accent}; border: 1px solid {asst_border};
                         border-radius: 10px; padding: 3px 10px; font-size: 11px; font-weight: 800; }}
             #chatHistory {{ background: {hist_bg}; border: 1px solid {asst_border}; border-radius: 16px; padding: 10px; font-size: 13px; }}
             #chatHistory QScrollBar:vertical {{ width: 8px; background: transparent; }}
@@ -664,45 +762,87 @@ class ChatWidget(QWidget, ComponentMixin):
             #previewBar {{ background: {card}; border: 1px dashed {asst_border}; border-radius: 12px; }}
             #chatInput {{ border: 1px solid {asst_border}; border-radius: 12px; padding: 8px 12px;
                          background: {card}; color: {ink}; font-size: 13px; }}
-            #chatInput:focus {{ border: 1px solid #2563eb; }}
-            #sendBtn {{ background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2f6fed, stop:1 #1d4ed8);
-                       color: white; border: none; border-radius: 12px;
+            #chatInput:focus {{ border: 1px solid {colors.accent}; }}
+            #sendBtn {{ background: {colors.primary};
+                       color: white; border: 1px solid {colors.primary}; border-radius: 9px;
                        padding: 8px 20px; font-weight: 700; font-size: 13px; }}
-            #sendBtn:hover {{ background: #1d4ed8; }}
-            #sendBtn:disabled {{ background: #93c5fd; color: #eff6ff; }}
+            #sendBtn:hover {{ background: {colors.primary_hover}; border-color: {colors.primary_hover}; }}
+            #sendBtn:pressed {{ background: {colors.primary_pressed}; border-color: {colors.primary_pressed}; }}
+            #sendBtn:focus {{ border-color: {ink}; }}
+            #sendBtn:disabled {{ background: {subtle}; border-color: {asst_border}; color: {muted}; }}
             #stopBtn {{ background: transparent; color: {muted}; border: 1px solid {asst_border};
-                       border-radius: 12px; padding: 8px 16px; font-size: 13px; }}
+                       border-radius: 9px; padding: 8px 16px; font-size: 13px; }}
             #stopBtn:hover {{ color: #dc2626; border: 1px solid #dc2626; }}
             #attachBtn {{ background: {subtle}; color: {muted}; border: 1px solid {asst_border};
-                         border-radius: 12px; font-size: 15px; }}
-            #attachBtn:hover {{ color: #2563eb; border: 1px solid #2563eb; }}
+                         border-radius: 9px; font-size: 15px; }}
+            #attachBtn:hover {{ background: {colors.selection}; color: {colors.accent}; border-color: {colors.accent}; }}
+            #attachBtn:pressed {{ background: {asst_border}; }}
+            #attachBtn:focus {{ border-color: {colors.accent}; }}
             #thumbBtn {{ background: {card}; border: 1px solid {asst_border}; border-radius: 8px; }}
             #thumbBtn:hover {{ border: 1px solid #dc2626; }}
-            #applyBtn {{ background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0ca678, stop:1 #059669);
-                        color: white; border: none; border-radius: 12px;
+            #applyBtn {{ background: {colors.primary};
+                        color: white; border: 1px solid {colors.primary}; border-radius: 9px;
                         padding: 8px 14px; font-weight: 700; font-size: 13px; }}
-            #applyBtn:hover {{ background: #047857; }}
-            #applyBtn:disabled {{ background: {subtle}; color: {muted}; }}
+            #applyBtn:hover {{ background: {colors.primary_hover}; border-color: {colors.primary_hover}; }}
+            #applyBtn:pressed {{ background: {colors.primary_pressed}; border-color: {colors.primary_pressed}; }}
+            #applyBtn:focus {{ border-color: {ink}; }}
+            #applyBtn:disabled {{ background: {subtle}; border-color: {asst_border}; color: {muted}; }}
             #expBtn {{ background: {card}; color: {ink}; border: 1px solid {asst_border};
-                      border-radius: 12px; padding: 8px 16px; font-size: 13px; font-weight: 600; }}
-            #expBtn:hover {{ border: 1px solid #2563eb; color: #2563eb; }}
-            #iconBtn {{ background: transparent; border: none; color: {muted}; border-radius: 8px; }}
-            #iconBtn:hover {{ background: {subtle}; }}
+                      border-radius: 9px; padding: 8px 16px; font-size: 13px; font-weight: 600; }}
+            #expBtn:hover {{ background: {colors.selection}; border-color: {colors.accent}; color: {colors.accent}; }}
+            #expBtn:pressed {{ background: {subtle}; border-color: {colors.accent}; }}
+            #expBtn:focus {{ border-color: {colors.accent}; }}
+            #expBtn:disabled, #stopBtn:disabled {{ color: {muted}; background: {subtle}; border-color: {asst_border}; }}
+            #iconBtn {{ background: {card}; border: 1px solid {asst_border}; color: {muted}; border-radius: 8px; }}
+            #iconBtn:hover {{ background: {colors.selection}; border-color: {colors.accent}; }}
+            #iconBtn:pressed {{ background: {subtle}; }}
+            #iconBtn:focus {{ border-color: {colors.accent}; }}
             #chatSidebar {{ background: {card}; border: 1px solid {asst_border}; border-radius: 16px; }}
             #sidebarTitle {{ color: {ink}; font-size: 13px; font-weight: 800; }}
             #sessionList {{ background: {card}; color: {ink}; border: none; outline: none; }}
             #sessionList::item {{ background: {subtle}; color: {ink}; border-radius: 10px;
                                  padding: 8px 10px; margin: 3px 0px; font-size: 12px; font-weight: 600; }}
-            #sessionList::item:selected {{ background: #2563eb; color: white; }}
+            #sessionList::item:selected {{ background: {colors.selection}; color: {colors.accent}; }}
             #sessionList::item:hover:!selected {{ background: {asst_border}; }}
             #muted {{ color: {muted}; font-size: 12px; }}
             #statusLbl {{ color: {muted}; font-size: 12px; }}
             #statusDot {{ color: #16a34a; font-size: 13px; }}
-            QCheckBox {{ color: {muted}; font-size: 12px; spacing: 5px; }}
-            QCheckBox::indicator {{ width: 15px; height: 15px; border-radius: 4px; border: 1px solid {asst_border}; background: {card}; }}
-            QCheckBox::indicator:checked {{ background: #2563eb; border: 1px solid #2563eb; }}
-            """
-        )
+            QCheckBox {{ color: {muted}; font-size: 12px; spacing: 8px; }}
+            QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 5px; border: 1px solid {asst_border}; background: {card}; }}
+            QCheckBox::indicator:hover, QCheckBox::indicator:focus {{ border: 1px solid {colors.accent}; }}
+            QCheckBox::indicator:checked {{ background: {colors.primary}; border: 1px solid {colors.primary}; }}
+            QCheckBox::indicator:checked:hover {{ background: {colors.primary_hover}; border-color: {colors.primary_hover}; }}
+            QCheckBox::indicator:checked:disabled {{ background: {muted}; border-color: {muted}; }}
+            """)
+        self.provider_combo.setProperty("dark", dark)
+        self.effort_combo.setProperty("dark", dark)
+        if _HAS_QTA:
+            provider_icons = {
+                "fireworks": ("fa5s.bolt", "#f59e0b"),
+                "featherless": ("fa5s.feather-alt", "#8b5cf6"),
+                "anthropic": ("fa5s.asterisk", "#d97757"),
+                "custom_openai": ("fa5s.plug", colors.accent),
+                "custom_anthropic": ("fa5s.plug", colors.accent),
+            }
+            for index in range(self.provider_combo.count()):
+                name, color = provider_icons[self.provider_combo.itemData(index)]
+                self.provider_combo.setItemIcon(index, qta.icon(name, color=color))
+            self.api_settings_btn.setIcon(qta.icon("fa5s.sliders-h", color=muted))
+            self.attach_btn.setIcon(qta.icon("fa5s.paperclip", color=muted))
+            self.send_btn.setIcon(qta.icon("fa5s.paper-plane", color="#ffffff"))
+            self.apply_btn.setIcon(qta.icon("fa5s.cube", color="#ffffff"))
+            self.undo_btn.setIcon(qta.icon("fa5s.undo", color=muted))
+            self.clear_btn.setIcon(qta.icon("fa5s.plus", color=colors.accent))
+            self.sidebar_new_btn.setIcon(qta.icon("fa5s.plus", color=colors.accent))
+            self.title_icon.setPixmap(
+                QPixmap(":/images/icons/cad_studio_mark.png").scaled(
+                    26, 26, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+            )
+        # Reserve the measured width of the longest provider name, including
+        # its icon, padding and arrow, rather than clipping it at a fixed width.
+        self.provider_combo.ensurePolished()
+        self.provider_combo.setMinimumWidth(self.provider_combo.sizeHint().width())
 
     # ------------- helpers -------------
     def _main(self):
@@ -724,7 +864,16 @@ class ChatWidget(QWidget, ComponentMixin):
     # document from parts on each change removes append-order quirks entirely.
     def _append_html(self, snippet):
         self._doc_parts.append(snippet)
-        self._refresh_view()
+        from PyQt5.QtGui import QTextCursor
+
+        cursor = self.history.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        if not self.history.document().isEmpty():
+            cursor.insertBlock()
+        cursor.insertHtml(snippet)
+        self.history.verticalScrollBar().setValue(
+            self.history.verticalScrollBar().maximum()
+        )
 
     def _refresh_view(self):
         try:
@@ -741,16 +890,16 @@ class ChatWidget(QWidget, ComponentMixin):
 
     def _welcome(self):
         """Professional greeting shown on a fresh panel."""
+        colors = theme_for(self._app_is_dark())
         self._append_html(
-            "<div style='text-align:center; margin:10px 16px 2px;'>"
-            "<div style='font-size:15px; font-weight:700;'>Design parts with words — or pictures</div>"
-            "<div style='font-size:12px; margin-top:4px;'>"
-            "Describe a part, attach a reference sketch or photo, and I'll generate "
-            "build123d code, validate it, and render it in the 3D view. "
-            "Vision is on: each render sends a screenshot back so I can verify it."
+            f"<div style='text-align:center; margin:28px 12px; color:{colors.text};'>"
+            "<div style='font-size:21px; font-weight:700;'>From idea to solid.</div>"
+            f"<div style='font-size:12px; margin-top:12px; color:{colors.muted};'>"
+            "Describe a part or attach a sketch.<br/>"
+            "Your assistant builds, checks, and refines it in the 3D view."
             "</div>"
-            "<div style='font-size:12px; margin-top:6px;'>"
-            "Try: “30×20×10 bracket, 5 mm holes in each corner, 2 mm fillets”"
+            f"<div style='font-size:12px; margin-top:18px; color:{colors.muted};'>"
+            "Try a 30 × 20 mm bracket with four mounting holes."
             "</div></div>"
         )
 
@@ -769,24 +918,18 @@ class ChatWidget(QWidget, ComponentMixin):
     def _bubble(self, who, text, kind="assistant", images=()):
         """Render one message as a modern rounded bubble with timestamp."""
         dark = self._app_is_dark()
-        if dark:
-            palette = {
-                "user": ("#2f6fed", "#ffffff", "You"),
-                "assistant": ("#232f52", "#e8edf7", "Assistant"),
-                "system": ("#101728", "#93a0b8", "Notice"),
-                "tool": ("#101728", "#93a0b8", "Tool"),
-                "error": ("#3f1d1d", "#fca5a5", "Error"),
-                "code": ("#0b1120", "#e8edf7", "Code"),
-            }
-        else:
-            palette = {
-                "user": ("#2563eb", "#ffffff", "You"),
-                "assistant": ("#ffffff", "#0f1f38", "Assistant"),
-                "system": ("#eef1f6", "#64748b", "Notice"),
-                "tool": ("#f8fafc", "#475569", "Tool"),
-                "error": ("#fef2f2", "#b91c1c", "Error"),
-                "code": ("#0f172a", "#e2e8f0", "Code"),
-            }
+        colors = theme_for(dark)
+        palette = {
+            "user": (colors.primary, "#ffffff", "You"),
+            "assistant": (colors.surface, colors.text, "Assistant"),
+            "system": (colors.window, colors.muted, "Notice"),
+            "tool": (colors.subtle, colors.muted, "Tool"),
+            "error": (
+                ("#3f1d1d", "#fca5a5", "Error")
+                if dark
+                else ("#fef2f2", "#b91c1c", "Error")
+            ),
+        }
         bg, fg, label = palette.get(kind, palette["assistant"])
         stamp = self._now()
         imgs = ""
@@ -803,7 +946,10 @@ class ChatWidget(QWidget, ComponentMixin):
         if kind == "user":
             return self._bubble_table(
                 f"{imgs}<div style='line-height:1.45;'>{safe}</div>",
-                bg, fg, "right", radius="16px 16px 4px 16px"
+                bg,
+                fg,
+                "right",
+                radius="16px 16px 4px 16px",
             )
         if kind == "system":
             # Vision feedback thumbnails also render here (screenshot the
@@ -815,11 +961,17 @@ class ChatWidget(QWidget, ComponentMixin):
         if imgs:
             return self._bubble_table(
                 f"{imgs}<div style='line-height:1.45;'>{safe}</div>",
-                bg, fg, "left", radius="16px 16px 16px 4px"
+                bg,
+                fg,
+                "left",
+                radius="16px 16px 16px 4px",
             )
         return self._bubble_table(
             f"<div style='line-height:1.45;'>{safe}</div>",
-            bg, fg, "left", radius="16px 16px 16px 4px"
+            bg,
+            fg,
+            "left",
+            radius="16px 16px 16px 4px",
         )
 
     def _code_block(self, code, stamp):
@@ -829,8 +981,8 @@ class ChatWidget(QWidget, ComponentMixin):
         (cq-copy:<n>) handled by anchorClicked -> clipboard.
         """
         dark = self._app_is_dark()
-        cbg = "#0b1120" if dark else "#0f172a"
-        cfg = "#e8edf7" if dark else "#e2e8f0"
+        colors = theme_for(dark)
+        cbg, cfg = colors.subtle, colors.text
         safe = html.escape(code)
         try:
             snippet_id = len(self._code_snippets)
@@ -839,10 +991,10 @@ class ChatWidget(QWidget, ComponentMixin):
             snippet_id = 0
         header = (
             f"<table width='100%' cellspacing='0' cellpadding='0'><tr>"
-            f"<td align='left' style='font-size:11px;color:#94a3b8;'>"
+            f"<td align='left' style='font-size:11px;color:{colors.muted};'>"
             f"Generated build123d code</td>"
             f"<td align='right'><a href='cq-copy:{snippet_id}' "
-            f"style='font-size:11px;color:#60a5fa;text-decoration:none;'>"
+            f"style='font-size:11px;color:{colors.accent};text-decoration:none;'>"
             f"[Copy]</a></td></tr></table>"
         )
         body = (
@@ -855,7 +1007,7 @@ class ChatWidget(QWidget, ComponentMixin):
         return (
             f"<div style='margin:8px 2px 12px;'>"
             f"{header}{body}"
-            f"<div style='font-size:11px;color:#64748b;margin-top:4px;'>"
+            f"<div style='font-size:11px;color:{colors.muted};margin-top:4px;'>"
             f"Applied to the editor &nbsp;·&nbsp; {stamp}</div></div>"
         )
 
@@ -878,10 +1030,14 @@ class ChatWidget(QWidget, ComponentMixin):
             pass
 
     def _append(self, who, text, images=()):
-        kind = {"you": "user", "assistant": "assistant", "system": "system",
-                "tool": "tool", "tool result": "tool", "error": "error"}.get(
-            who.lower(), "assistant"
-        )
+        kind = {
+            "you": "user",
+            "assistant": "assistant",
+            "system": "system",
+            "tool": "tool",
+            "tool result": "tool",
+            "error": "error",
+        }.get(who.lower(), "assistant")
         # User messages with reference images always render the photo bubble.
         if kind == "user" and images:
             self._append_html(self._bubble(who, text[:4000], kind=kind, images=images))
@@ -902,10 +1058,15 @@ class ChatWidget(QWidget, ComponentMixin):
         self.stop_btn.setEnabled(busy)
         self.provider_combo.setEnabled(not busy)
         self.api_settings_btn.setEnabled(not busy)
+        self.verification.verify_btn.setEnabled(not busy)
+        self.verification.checks_btn.setEnabled(not busy)
+        self.clear_btn.setEnabled(not busy)
+        self.sidebar_new_btn.setEnabled(not busy)
+        self.apply_btn.setEnabled(not busy and bool(self.last_code))
+        self.undo_btn.setEnabled(not busy and bool(self.code_history))
+        self.sidebar.setEnabled(not busy)
         try:
-            self.status_dot.setStyleSheet(
-                f"color: {'#f59e0b' if busy else '#16a34a'};"
-            )
+            self.status_dot.setStyleSheet(f"color: {'#f59e0b' if busy else '#16a34a'};")
         except Exception:
             pass
         if busy:
@@ -922,7 +1083,7 @@ class ChatWidget(QWidget, ComponentMixin):
 
     def _tick_busy(self):
         """Animated ellipsis on the status line while a request runs."""
-        if self.worker is None:
+        if self.worker is None and not self._operation_active:
             return
         self._busy_dots = (self._busy_dots + 1) % 4
         base = getattr(self, "_busy_base", "Working")
@@ -930,9 +1091,8 @@ class ChatWidget(QWidget, ComponentMixin):
 
     def _thinking_block_html(self, thinking_text):
         """Muted reasoning block (shown live during thinking + in transcript)."""
-        dark = self._app_is_dark()
-        fg = "#93a0b8" if dark else "#64748b"
-        edge = "#33436b" if dark else "#cbd5e1"
+        colors = theme_for(self._app_is_dark())
+        fg, edge = colors.muted, colors.border
         body = html.escape(thinking_text).replace("\n", "<br/>")
         return (
             f"<div style='font-size:11px; color:{fg}; border-left:2px solid {edge}; "
@@ -960,20 +1120,31 @@ class ChatWidget(QWidget, ComponentMixin):
         if (thinking_text or "").strip():
             self._append_html(self._thinking_block_html(thinking_text))
 
-    def _stream_bubble(self):
+    def _stream_bubble(self, final=False):
         """Live assistant bubble, rebuilt from the buffers on every token."""
-        dark = self._app_is_dark()
-        bg = "#232f52" if dark else "#ffffff"
-        fg = "#e8edf7" if dark else "#0f1f38"
+        colors = theme_for(self._app_is_dark())
+        bg, fg = colors.surface, colors.text
         thinking = ""
         if self._think_buf.strip():
-            thinking = self._thinking_block_html(self._think_buf)
-        body = html.escape(self._stream_buf).replace("\n", "<br/>")
+            thinking = self._thinking_block_html(
+                self._think_buf[-(20000 if final else 8000) :]
+            )
+        limit = 100000 if final else 16000
+        preview = self._stream_buf[-limit:]
+        notice = ""
+        if len(self._stream_buf) > limit or len(self._think_buf) > (
+            20000 if final else 8000
+        ):
+            notice = "<div>Showing the latest portion; the full response is kept in the chat session.</div>"
+        body = html.escape(preview).replace("\n", "<br/>")
         return self._bubble_table(
             f"<div style='font-size:11px; margin-bottom:4px;'>"
-            f"Assistant &gt; live</div>{thinking}"
+            f"Assistant &gt; {'response' if final else 'live'}</div>{notice}{thinking}"
             f"<div style='line-height:1.45;'>{body}</div>",
-            bg, fg, "left", radius="16px 16px 16px 4px",
+            bg,
+            fg,
+            "left",
+            radius="16px 16px 16px 4px",
         )
 
     def _append_stream_start(self):
@@ -982,17 +1153,39 @@ class ChatWidget(QWidget, ComponentMixin):
         self._stream_dirty = False
         self._stream_active = True
         self._doc_parts.append("")  # reserved slot, rewritten per token
+        from PyQt5.QtGui import QTextCursor
+
+        cursor = self.history.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertBlock()
+        self._stream_start_pos = cursor.position()
         self._refresh_stream_slot()
 
-    def _refresh_stream_slot(self):
+    def _refresh_stream_slot(self, final=False):
+        from PyQt5.QtGui import QTextCursor
+
+        snippet = self._stream_bubble(final=final)
         if self._doc_parts:
-            self._doc_parts[-1] = self._stream_bubble()
+            self._doc_parts[-1] = snippet
         else:
-            self._doc_parts.append(self._stream_bubble())
-        self._refresh_view()
+            self._doc_parts.append(snippet)
+        cursor = self.history.textCursor()
+        start = self._stream_start_pos
+        if start is None or start > self.history.document().characterCount() - 1:
+            cursor.movePosition(QTextCursor.End)
+            cursor.insertBlock()
+            start = self._stream_start_pos = cursor.position()
+        cursor.setPosition(start)
+        cursor.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
+        cursor.insertHtml(snippet)
+        self.history.verticalScrollBar().setValue(
+            self.history.verticalScrollBar().maximum()
+        )
 
     @pyqtSlot(str)
     def on_stream_text(self, delta):
+        if isinstance(self.sender(), LLMWorker) and self.sender() is not self.worker:
+            return
         if not self._stream_active:
             self._append_stream_start()
         self._stream_buf += delta
@@ -1001,6 +1194,8 @@ class ChatWidget(QWidget, ComponentMixin):
 
     @pyqtSlot(str)
     def on_thinking_text(self, delta):
+        if isinstance(self.sender(), LLMWorker) and self.sender() is not self.worker:
+            return
         if not self._stream_active:
             self._append_stream_start()
         self._think_buf += delta
@@ -1038,24 +1233,25 @@ class ChatWidget(QWidget, ComponentMixin):
                 self._stream_timer.stop()
         except Exception:
             pass
-        if self._stream_active and self._stream_dirty:
+        if self._stream_active:
             self._stream_dirty = False
-            self._refresh_stream_slot()
+            self._refresh_stream_slot(final=True)
         self._stream_active = False
+        self._stream_start_pos = None
 
     # ------------- reference images -------------
     MAX_IMAGES = 3
     IMAGE_SIDE = 1024  # longest side sent to the model (keeps token cost sane)
 
     @staticmethod
-    def _encode_image(path):
-        """Load, downscale and JPEG-encode an image file.
+    def _encode_qimage(image, name):
+        """Downscale and JPEG-encode a QImage.
 
         Returns dict(name, bytes, w, h) or an error string on failure.
         """
-        img = QImage(path)
+        img = QImage(image)
         if img.isNull():
-            return f"Could not read image: {path}"
+            return f"Could not read image: {name}"
         if max(img.width(), img.height()) > ChatWidget.IMAGE_SIDE:
             img = img.scaled(
                 ChatWidget.IMAGE_SIDE,
@@ -1068,13 +1264,91 @@ class ChatWidget(QWidget, ComponentMixin):
         buf = QBuffer()
         buf.open(QIODevice.WriteOnly)
         if not img.save(buf, "JPEG", 75):
-            return f"Could not encode image: {path}"
+            return f"Could not encode image: {name}"
         return {
-            "name": Path(path).name,
+            "name": name,
             "bytes": bytes(buf.data()),
             "w": img.width(),
             "h": img.height(),
         }
+
+    @staticmethod
+    def _encode_image(path):
+        """Load, downscale and JPEG-encode an image file."""
+        return ChatWidget._encode_qimage(QImage(path), Path(path).name)
+
+    def _add_pending_image(self, image, name):
+        """Encode one image for the next message.  Returns (added, error)."""
+        if len(self.pending_images) >= self.MAX_IMAGES:
+            return False, f"Up to {self.MAX_IMAGES} images per message."
+        item = self._encode_qimage(image, name)
+        if isinstance(item, str):
+            return False, item
+        self.pending_images.append(item)
+        return True, None
+
+    def _clipboard_images(self):
+        """Return image candidates from the clipboard, without treating text as an image."""
+        mime = QApplication.clipboard().mimeData()
+        if mime is None:
+            return []
+
+        if mime.hasImage():
+            image = mime.imageData()
+            if isinstance(image, QPixmap):
+                image = image.toImage()
+            if isinstance(image, QImage) and not image.isNull():
+                return [(image, "Pasted image")]
+
+        # Copying an image file in Explorer produces URLs rather than imageData.
+        images = []
+        image_suffixes = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+        for url in mime.urls() if mime.hasUrls() else []:
+            if not url.isLocalFile():
+                continue
+            path = url.toLocalFile()
+            if Path(path).suffix.lower() not in image_suffixes:
+                continue
+            image = QImage(path)
+            if not image.isNull():
+                images.append((image, Path(path).name))
+        if images:
+            return images
+
+        # Some applications expose only a concrete image MIME payload.
+        for image_format in mime.formats():
+            if not image_format.lower().startswith("image/"):
+                continue
+            image = QImage.fromData(bytes(mime.data(image_format)))
+            if not image.isNull():
+                return [(image, "Pasted image")]
+        return []
+
+    def _paste_clipboard_images(self):
+        """Attach clipboard images and report whether this was an image paste."""
+        images = self._clipboard_images()
+        if not images:
+            return False
+        if self.worker is not None:
+            self.status.setText(
+                "Wait for the current request before attaching an image."
+            )
+            return True
+
+        added = 0
+        error = None
+        for image, name in images:
+            ok, error = self._add_pending_image(image, name)
+            if not ok:
+                break
+            added += 1
+        if added:
+            self._refresh_previews()
+            noun = "image" if added == 1 else "images"
+            self.status.setText(f"Pasted {added} reference {noun}.")
+        elif error:
+            self.status.setText(error)
+        return True
 
     @pyqtSlot()
     def on_attach(self):
@@ -1092,11 +1366,11 @@ class ChatWidget(QWidget, ComponentMixin):
         for path in paths:
             if len(self.pending_images) >= self.MAX_IMAGES:
                 break
-            item = self._encode_image(path)
-            if isinstance(item, str):
-                self._append("Error", item)
+            ok, error = self._add_pending_image(QImage(path), Path(path).name)
+            if not ok:
+                if error:
+                    self._append("Error", error)
                 continue
-            self.pending_images.append(item)
         self._refresh_previews()
 
     def _refresh_previews(self):
@@ -1158,9 +1432,13 @@ class ChatWidget(QWidget, ComponentMixin):
         if not self.messages and not (self.session_design or "").strip():
             return  # brand-new untouched session: write nothing yet
         self._store.save_session(
-            self.session_id, self.messages,
-            title=self.session_title, model=getattr(self, "_model", ""),
-            usage=self.sess_usage, design_code=self.session_design,
+            self.session_id,
+            self.messages,
+            title=self.session_title,
+            model=getattr(self, "_model", ""),
+            usage=self.sess_usage,
+            design_code=self.session_design,
+            requirements=self.design_requirements,
         )
         # Keep the sidebar title/preview in sync (cheap: index rewrite only).
         try:
@@ -1227,6 +1505,8 @@ class ChatWidget(QWidget, ComponentMixin):
         """Replay stored messages as bubbles (tool noise skipped)."""
         self._doc_parts = []
         self._code_snippets = []
+        self.history.clear()
+        self._stream_start_pos = None
         if recap:
             self._append("System", recap)
         if not self.messages:
@@ -1246,7 +1526,7 @@ class ChatWidget(QWidget, ComponentMixin):
                     if block.get("type") == "text" and block.get("text", "").strip():
                         texts.append(block["text"])
                     elif block.get("type") == "image":
-                        data = ((block.get("source") or {}).get("data") or "")
+                        data = (block.get("source") or {}).get("data") or ""
                         if data:
                             thumbs.append(data)
                     elif block.get("type") == "tool_result":
@@ -1256,12 +1536,13 @@ class ChatWidget(QWidget, ComponentMixin):
                                 if not isinstance(sub, dict):
                                     continue
                                 if sub.get("type") == "image":
-                                    data = ((sub.get("source") or {}).get("data") or "")
+                                    data = (sub.get("source") or {}).get("data") or ""
                                     if data:
                                         shot_thumbs.append(data)
                 if texts or thumbs:
-                    self._append("You", "\n".join(texts) or "(reference images)",
-                                 images=thumbs)
+                    self._append(
+                        "You", "\n".join(texts) or "(reference images)", images=thumbs
+                    )
                 if shot_thumbs:
                     # Screenshots the model saw (auto visual feedback).
                     self._append(
@@ -1275,7 +1556,9 @@ class ChatWidget(QWidget, ComponentMixin):
                     if isinstance(block, dict):
                         btype, text = block.get("type"), block.get("text", "")
                     else:
-                        btype, text = getattr(block, "type", ""), getattr(block, "text", "")
+                        btype, text = getattr(block, "type", ""), getattr(
+                            block, "text", ""
+                        )
                     if btype == "text" and (text or "").strip():
                         texts.append(text)
                 shown = "\n".join(texts).strip()
@@ -1297,7 +1580,7 @@ class ChatWidget(QWidget, ComponentMixin):
         until the first message or applied design — with an empty editor
         and an empty 3D board. Nothing is rendered automatically.
         """
-        if self.worker is not None:
+        if self.worker is not None or self._operation_active:
             self.status.setText("Stop the running request first.")
             return
         self._stash_design()
@@ -1307,6 +1590,7 @@ class ChatWidget(QWidget, ComponentMixin):
         self.messages = []
         self.last_code = ""
         self.session_design = ""
+        self._set_requirements([])
         self.sess_usage = {"in": 0, "out": 0}
         self.last_usage = {"in": 0, "out": 0}
         self._turn_steps = 0
@@ -1352,7 +1636,9 @@ class ChatWidget(QWidget, ComponentMixin):
             self._update_meter(0)
             self._reset_editor_to_empty()
             self._clear_board()
-            self._append("System", "New chat started — empty design, nothing rendered yet.")
+            self._append(
+                "System", "New chat started — empty design, nothing rendered yet."
+            )
             self._set_busy(False, "New chat started.")
             self._refresh_session_combo()
             return
@@ -1375,13 +1661,17 @@ class ChatWidget(QWidget, ComponentMixin):
         self.pending_images = []
         self._refresh_previews()
         usage = (meta or {}).get("usage") or {}
-        self.sess_usage = {"in": int(usage.get("in", 0) or 0),
-                           "out": int(usage.get("out", 0) or 0)}
+        self.sess_usage = {
+            "in": int(usage.get("in", 0) or 0),
+            "out": int(usage.get("out", 0) or 0),
+        }
         self.last_usage = {"in": 0, "out": 0}
         self._turn_steps = 0
-        recap = (f"Resumed “{self.session_title}” — {len(messages)} messages · "
-                 f"in/out {self._fmt_tokens(self.sess_usage['in'])}"
-                 f"/{self._fmt_tokens(self.sess_usage['out'])} total")
+        recap = (
+            f"Resumed “{self.session_title}” — {len(messages)} messages · "
+            f"in/out {self._fmt_tokens(self.sess_usage['in'])}"
+            f"/{self._fmt_tokens(self.sess_usage['out'])} total"
+        )
         self._render_history(recap=recap)
         self._update_meter()
         design_note = self._restore_session_design()
@@ -1428,10 +1718,16 @@ class ChatWidget(QWidget, ComponentMixin):
             self.on_new_session()
             return
         title = self.session_title
-        if QMessageBox.question(
-            self, "Delete chat", f"Delete “{title}” permanently?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-        ) != QMessageBox.Yes:
+        if (
+            QMessageBox.question(
+                self,
+                "Delete chat",
+                f"Delete “{title}” permanently?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            != QMessageBox.Yes
+        ):
             return
         self._store.delete_session(self.session_id)
         remaining = self._store.list_sessions()
@@ -1479,10 +1775,12 @@ class ChatWidget(QWidget, ComponentMixin):
             pass
         self._append(
             "System",
-            "Plan mode ON: code is validated but never auto-applied. "
-            "Review it, then press “Insert code + Render”. (/plan to toggle)"
-            if self.plan_mode else
-            "Plan mode OFF: generated code auto-applies again.",
+            (
+                "Plan mode ON: code is validated but never auto-applied. "
+                "Review it, then press “Insert code + Render”. (/plan to toggle)"
+                if self.plan_mode
+                else "Plan mode OFF: generated code auto-applies again."
+            ),
         )
 
     @pyqtSlot(bool)
@@ -1529,7 +1827,9 @@ class ChatWidget(QWidget, ComponentMixin):
             self.effort_combo.blockSignals(False)
         self._refresh_model_lbl()
         if announce:
-            self._append("System", f"Effort set to {level.title()}.\n{self._effort_summary()}")
+            self._append(
+                "System", f"Effort set to {level.title()}.\n{self._effort_summary()}"
+            )
 
     @pyqtSlot(str)
     def on_effort_changed(self, text):
@@ -1555,57 +1855,31 @@ class ChatWidget(QWidget, ComponentMixin):
         self._model = ""
         self._refresh_provider_pill()
         self._refresh_model_lbl()
-        self.status.setText(f"Selected {PROVIDERS[provider].label}. Configure it in Provider settings if needed.")
+        self.status.setText(
+            f"Selected {PROVIDERS[provider].label}. Configure it in Provider settings if needed."
+        )
 
     def _edit_provider_settings(self):
-        """Edit a local profile without placing its key in chat history."""
-        config = self._selected_config()
-        spec = PROVIDERS[config.provider]
-        dialog = QDialog(self)
-        dialog.setWindowTitle(f"{spec.label} settings")
-        layout = QVBoxLayout(dialog)
-        form = QFormLayout()
-        key = QLineEdit(config.api_key, dialog)
-        key.setEchoMode(QLineEdit.Password)
-        key.setPlaceholderText(f"{spec.key_env} or paste a key")
-        show_key = QCheckBox("Show API key", dialog)
-        show_key.toggled.connect(lambda visible: key.setEchoMode(QLineEdit.Normal if visible else QLineEdit.Password))
-        model = QLineEdit(config.model, dialog)
-        model.setPlaceholderText("Model ID")
-        base_url = QLineEdit(config.base_url, dialog)
-        base_url.setPlaceholderText("https://provider.example/v1")
-        form.addRow("API key:", key)
-        form.addRow("", show_key)
-        form.addRow("Model:", model)
-        form.addRow("API base URL:", base_url)
-        layout.addLayout(form)
-        note = QLabel("Stored locally in application settings, unencrypted. API keys are never added to chat sessions or exports.", dialog)
-        note.setWordWrap(True)
-        note.setObjectName("muted")
-        layout.addWidget(note)
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, parent=dialog)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        if dialog.exec_() != QDialog.Accepted:
-            return
-        updated = ProviderConfig(config.provider, key.text().strip(), model.text().strip(), base_url.text().strip())
-        try:
-            self._provider_settings.save(updated)
-        except RuntimeError as error:
-            QMessageBox.warning(self, "Provider settings", str(error))
-            return
-        self._client = None
-        self._model = ""
-        self._refresh_provider_pill()
-        self._refresh_model_lbl()
-        self.status.setText(f"Saved {spec.label} settings.")
+        dialog = ProviderSettingsDialog(self._selected_config(), self)
+        if dialog.exec_() == dialog.Accepted:
+            self._provider_settings.save(dialog.config())
+            self._client = None
+            self._model = ""
+            self._refresh_provider_controls()
+            self._refresh_model_lbl()
+            self.status.setText("API settings saved. Ready for the next message.")
 
     def _refresh_model_lbl(self):
         try:
-            model = getattr(self, "_model", "") or self._selected_config().model or "not configured"
+            model = (
+                getattr(self, "_model", "")
+                or self._selected_config().model
+                or "not configured"
+            )
             self.model_lbl.setText(f"Model: {model} · Effort: {self.effort.title()}")
-            self.model_lbl.setToolTip(f"Selected provider: {PROVIDERS[self._selected_provider()].label}")
+            self.model_lbl.setToolTip(
+                f"Selected provider: {PROVIDERS[self._selected_provider()].label}"
+            )
         except Exception:
             pass
 
@@ -1671,6 +1945,7 @@ class ChatWidget(QWidget, ComponentMixin):
             "/undo": self.on_undo,
             "/export": self._cmd_export,
             "/examples": lambda: self._append("System", self.get_examples()),
+            "/skills": lambda: self._cmd_skills(text),
             "/compact": self._cmd_compact,
             "/model": self._cmd_model,
             "/effort": lambda: self._cmd_effort(text),
@@ -1693,6 +1968,15 @@ class ChatWidget(QWidget, ComponentMixin):
         lines = ["Slash commands — type / to complete, Enter to run:"]
         lines += [f"  {cmd:<10} {desc}" for cmd, desc in SLASH_COMMANDS.items()]
         return "\n".join(lines)
+
+    def _cmd_skills(self, text):
+        arguments = text.split()[1:]
+        output = (
+            self._skills.view(arguments[0], draft="draft" in arguments[1:])
+            if arguments
+            else self._skills.summary()
+        )
+        self._append("System", output)
 
     def _payload_chars(self):
         try:
@@ -1774,18 +2058,27 @@ class ChatWidget(QWidget, ComponentMixin):
             if role == "user" and isinstance(content, str):
                 out += ["## You", "", content, ""]
             elif role == "user" and isinstance(content, list):
-                parts = [b.get("text", "") for b in content
-                         if isinstance(b, dict) and b.get("type") == "text"]
-                imgs = sum(1 for b in content
-                           if isinstance(b, dict) and b.get("type") == "image")
+                parts = [
+                    b.get("text", "")
+                    for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                ]
+                imgs = sum(
+                    1
+                    for b in content
+                    if isinstance(b, dict) and b.get("type") == "image"
+                )
                 shots = 0
                 for b in content:
                     if not isinstance(b, dict) or b.get("type") != "tool_result":
                         continue
                     inner = b.get("content", "")
                     if isinstance(inner, list):
-                        shots += sum(1 for s in inner
-                                     if isinstance(s, dict) and s.get("type") == "image")
+                        shots += sum(
+                            1
+                            for s in inner
+                            if isinstance(s, dict) and s.get("type") == "image"
+                        )
                 if imgs:
                     parts.append(f"_[{imgs} reference image(s) attached]_")
                 if shots:
@@ -1802,7 +2095,9 @@ class ChatWidget(QWidget, ComponentMixin):
                     if btype == "text" and text.strip():
                         texts.append(text)
                     elif btype == "tool_use":
-                        name = block.get("name") if isinstance(block, dict) else block.name
+                        name = (
+                            block.get("name") if isinstance(block, dict) else block.name
+                        )
                         texts.append(f"_⚙ tool: {name}_")
                 if texts:
                     out += ["## Assistant", "", "\n".join(texts), ""]
@@ -1810,7 +2105,9 @@ class ChatWidget(QWidget, ComponentMixin):
 
     def _cmd_export(self):
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save chat transcript", f"{self.session_title}.md",
+            self,
+            "Save chat transcript",
+            f"{self.session_title}.md",
             "Markdown (*.md)",
         )
         if not path:
@@ -1900,10 +2197,14 @@ class ChatWidget(QWidget, ComponentMixin):
             if payload_chars is None:
                 payload_chars = self._payload_chars()
             ctx = self._fmt_tokens(payload_chars // 4)
-            last = (f"{self._fmt_tokens(self.last_usage['in'])}"
-                    f"/{self._fmt_tokens(self.last_usage['out'])} last")
-            sess = (f"{self._fmt_tokens(self.sess_usage['in'])}"
-                    f"/{self._fmt_tokens(self.sess_usage['out'])} total")
+            last = (
+                f"{self._fmt_tokens(self.last_usage['in'])}"
+                f"/{self._fmt_tokens(self.last_usage['out'])} last"
+            )
+            sess = (
+                f"{self._fmt_tokens(self.sess_usage['in'])}"
+                f"/{self._fmt_tokens(self.sess_usage['out'])} total"
+            )
             self.meter_lbl.setText(f"ctx ~{ctx} in/out · {last} · {sess}")
         except Exception:
             pass
@@ -1937,7 +2238,16 @@ class ChatWidget(QWidget, ComponentMixin):
     @pyqtSlot()
     def on_send(self):
         prompt = self.input.toPlainText().strip()
-        if (not prompt and not self.pending_images) or self.worker is not None:
+        if (
+            (not prompt and not self.pending_images)
+            or self.worker is not None
+            or self._operation_active
+        ):
+            return
+        if sum(w.isRunning() for w in self._active_workers) >= 2:
+            self.status.setText(
+                "Two cancelled requests are still disconnecting. Please wait for their network timeouts."
+            )
             return
         # Slash commands run locally, never reach the model.
         if prompt.startswith("/") and not self.pending_images:
@@ -1952,16 +2262,25 @@ class ChatWidget(QWidget, ComponentMixin):
             self.status.setText(str(e))
             return
         self._client, self._model = client, model
+        self._requirements_recorded_this_turn = False
+        self.verification.invalidate()
+        self.verification_report = None
+        self._verification_code = None
+        self._visual_capture_revision = None
+        self._validated_job = None
         self._refresh_provider_pill()
         self._refresh_model_lbl()
         self._ensure_session()
         _has_images = bool(self.pending_images)
         if is_auto_title(self.session_title) and (prompt or _has_images):
             if _has_images and not prompt:
-                blocks_for_title = [{"type": "image"},
-                                    {"type": "text", "text": "Reference images"}]
+                blocks_for_title = [
+                    {"type": "image"},
+                    {"type": "text", "text": "Reference images"},
+                ]
                 self.session_title = autotitle(
-                    [{"role": "user", "content": blocks_for_title}])
+                    [{"role": "user", "content": blocks_for_title}]
+                )
             elif prompt:
                 self.session_title = autotitle([{"role": "user", "content": prompt}])
             self._save_session()
@@ -1971,10 +2290,17 @@ class ChatWidget(QWidget, ComponentMixin):
         self._refresh_previews()
         if images:
             blocks = [self._image_block(item) for item in images]
-            blocks.append({"type": "text", "text": prompt or
-                           "Model the part shown in the attached reference image(s) in mm."})
+            blocks.append(
+                {
+                    "type": "text",
+                    "text": prompt
+                    or "Model the part shown in the attached reference image(s) in mm.",
+                }
+            )
             self.messages.append({"role": "user", "content": blocks})
-            thumbs = [base64.b64encode(item["bytes"]).decode("ascii") for item in images]
+            thumbs = [
+                base64.b64encode(item["bytes"]).decode("ascii") for item in images
+            ]
             self._append("You", prompt or "(reference images)", images=thumbs)
         else:
             self.messages.append({"role": "user", "content": prompt})
@@ -1986,20 +2312,28 @@ class ChatWidget(QWidget, ComponentMixin):
             self.sent_history = self.sent_history[-100:]
         self.iters_left = int(self.preferences["Max tool iterations"])
         self._turn_steps = 0
+        self._finalizing = False
+        self._stop_requested = False
+        self._request_rendered = False
         self._kick_llm()
 
+    def _refresh_provider_controls(self):
+        provider = self.provider_combo.currentData()
+        self.provider_combo.setToolTip(f"AI provider: {PROVIDERS[provider].label}")
+        self.api_settings_btn.setToolTip(
+            f"Manage {PROVIDERS[provider].label} API key and model"
+        )
+
     def _refresh_provider_pill(self):
-        """Show the provider selected for the next request."""
-        try:
-            self.provider_pill.setText(f"● {PROVIDERS[self._selected_provider()].label}")
-        except Exception:
-            pass
+        self._refresh_provider_controls()
 
     def eventFilter(self, obj, event):
         """Enter sends, Shift+Enter inserts a newline, Up/Down recalls history."""
         if obj is self.input and event.type() == event.KeyPress:
             key = event.key()
             mods = event.modifiers()
+            if event.matches(QKeySequence.Paste) and self._paste_clipboard_images():
+                return True
             if key in (Qt.Key_Return, Qt.Key_Enter) and not (mods & Qt.ShiftModifier):
                 try:
                     if self.slash_completer.popup().isVisible():
@@ -2028,8 +2362,9 @@ class ChatWidget(QWidget, ComponentMixin):
             return
         if self._hist_idx is None:
             self._hist_idx = len(self.sent_history) if direction < 0 else -1
-        self._hist_idx = max(-1, min(len(self.sent_history) - 1,
-                                     self._hist_idx + direction))
+        self._hist_idx = max(
+            -1, min(len(self.sent_history) - 1, self._hist_idx + direction)
+        )
         text = "" if self._hist_idx < 0 else self.sent_history[self._hist_idx]
         try:
             self.input.blockSignals(True)
@@ -2048,63 +2383,201 @@ class ChatWidget(QWidget, ComponentMixin):
     def on_stop(self):
         """Cancel the in-flight request and halt the agent loop."""
         self.iters_left = 0
-        w, self.worker = self.worker, None
+        self._stop_requested = True
+        main = self._main()
+        if main is not None:
+            main.components["debugger"].cancel_render()
+        if self._operation_active:
+            self.status.setText("Stopping CAD operation…")
+            return
+        w = self.worker
         if w is not None:
-            try:
-                w.terminate()
-                w.wait(2000)
-            except Exception:
-                pass
-            try:
-                w.deleteLater()
-            except Exception:
-                pass
+            w.requestInterruption()
+            # Discard late replies while the socket finishes in the background.
+            # Keep a strong reference until QThread.finished to prevent teardown crashes.
+            self.worker = None
+            self._finish_stream_display()
+            self._set_busy(
+                False,
+                "Stopped. The network request is disconnecting in the background.",
+            )
+            return
         self._finish_stream_display()
         self._append("System", "Stopped by user.")
         self._set_busy(False)
 
     def _kick_llm(self):
-        self._set_busy(True)
+        self._set_busy(
+            True, "Preparing final design" if self._finalizing else "Working"
+        )
         # s08-style: send a compacted copy (stale thinking dropped, old code
         # and old tool results shortened). self.messages stays complete.
-        from ..ai.cad_agent import compact_messages, thinking_params_for
+        from ..ai.cad_agent import thinking_params_for
 
-        payload = compact_messages(self.messages)
+        payload = self.messages
         thinking = thinking_params_for(self._model, self.effort)
         max_tokens = max_tokens_for_effort(self.effort)
+        learning = (
+            bool(self.preferences["Learn reusable CAD skills"]) and not self.plan_mode
+        )
+        tools = (
+            []
+            if self._finalizing
+            else [tool for tool in TOOLS if learning or tool["name"] != "skill_manage"]
+        )
         self._stream_buf = ""
         self._think_buf = ""
         if self.stream_check.isChecked():
             self._append_stream_start()
             self.worker = StreamWorker(
-                self._client, self._model, payload, self,
-                thinking=thinking, max_tokens=max_tokens,
+                self._client,
+                self._model,
+                payload,
+                self,
+                thinking=thinking,
+                max_tokens=max_tokens,
+                tools=tools,
+                skills=self._skills,
+                learning=learning,
             )
             self.worker.text_delta.connect(self.on_stream_text)
             self.worker.thinking_delta.connect(self.on_thinking_text)
+            self.worker.stream_reset.connect(self._reset_live_reply)
         else:
             self.worker = LLMWorker(
-                self._client, self._model, payload, self,
-                thinking=thinking, max_tokens=max_tokens,
+                self._client,
+                self._model,
+                payload,
+                self,
+                thinking=thinking,
+                max_tokens=max_tokens,
+                tools=tools,
+                skills=self._skills,
+                learning=learning,
             )
         self.worker.finished_ok.connect(self.on_llm_ok)
         self.worker.finished_err.connect(self.on_llm_err)
+        self.worker.status_changed.connect(self._recovery_status)
+        self._retain_worker(self.worker)
         self.worker.start()
+
+    def _retain_worker(self, worker):
+        """Keep threads alive until run() has actually returned."""
+        self._active_workers.append(worker)
+
+        def finished():
+            if worker in self._active_workers:
+                self._active_workers.remove(worker)
+            worker.deleteLater()
+
+        worker.finished.connect(finished)
+
+    def _continue_tool_loop(self):
+        """Allow one final reply after the bounded tool rounds are exhausted."""
+        if self._stop_requested:
+            self._set_busy(False, "Stopped by user.")
+            return
+        if self.iters_left > 0 and not self._finalizing:
+            self._kick_llm()
+            return
+        if self._finalizing:
+            self._set_busy(
+                False,
+                "Automatic attempts finished. Review the last result before retrying.",
+            )
+            return
+        self._finalizing = True
+        if self._request_rendered:
+            instruction = (
+                "The model was rendered successfully and the tool-round limit has been reached. "
+                "Summarize the actual result and any unresolved issues. Do not call more tools "
+                "or repeat the rendered script. Do not claim checks that did not happen."
+            )
+        else:
+            instruction = (
+                "The tool-round limit has been reached. Do not call any more tools. "
+                "Using the original request and tool results, return ONE complete ```python "
+                "script for the finished design, ending in show_object(result). The app will "
+                "validate it before applying it. Preserve all requested dimensions and features. "
+                "If you cannot finish, explain the unresolved problem instead of claiming success."
+            )
+        self.messages.append({"role": "user", "content": instruction})
+        self._append("System", "Preparing a final response from the tool results.")
+        self._kick_llm()
+
+    @staticmethod
+    def _tool_failed(output):
+        return output.lstrip().startswith(
+            (
+                "Error:",
+                "Traceback",
+                "CRASH:",
+                "TIMEOUT:",
+                "Rendered WITH traceback:",
+                "Subagent failed:",
+                "Error reading editor:",
+                "Error listing examples:",
+                "Error applying code:",
+                "Error exporting:",
+            )
+        )
+
+    @pyqtSlot()
+    def _reset_live_reply(self):
+        if isinstance(self.sender(), LLMWorker) and self.sender() is not self.worker:
+            return
+        self._stream_buf = ""
+        self._think_buf = ""
+        if self._stream_active:
+            self._stream_dirty = True
+
+    @pyqtSlot(str)
+    def _recovery_status(self, message):
+        if isinstance(self.sender(), LLMWorker) and self.sender() is not self.worker:
+            return
+        self._busy_base = message
+        self.status.setText(message)
 
     @pyqtSlot(object)
     def on_llm_ok(self, resp):
-        if self.worker is not None:
-            try:
-                self.worker.deleteLater()
-            except Exception:
-                pass
+        if isinstance(self.sender(), LLMWorker) and self.sender() is not self.worker:
+            return
         self.worker = None
         self._finish_stream_display()
         content = getattr(resp, "content", [])
         stop = getattr(resp, "stop_reason", "") or ""
+        if self._stop_requested or (self.iters_left <= 0 and not self._finalizing):
+            self._set_busy(False, "Stopped. No further code was applied.")
+            return
+        if stop in ("max_tokens", "length"):
+            self.on_llm_err(
+                "Reply is incomplete after automatic recovery. No partial code was applied."
+            )
+            return
         self._track_usage(resp)
         self.messages.append({"role": "assistant", "content": content})
         tool_calls = [b for b in content if getattr(b, "type", "") == "tool_use"]
+        if self._finalizing and tool_calls:
+            # Close the tool pairs without dispatching an out-of-budget call.
+            self.messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": "Tool-round limit reached. This tool was not executed.",
+                            "is_error": True,
+                        }
+                        for block in tool_calls
+                    ],
+                }
+            )
+            self._set_busy(
+                False,
+                "The model requested more tools after the final attempt. Simplify the request or increase Max tool iterations in Preferences.",
+            )
+            return
         texts = [b.text for b in content if getattr(b, "type", "") == "text"]
         shown = " ".join(texts).strip()
         thinking_text = self._thinking_text_of(content)
@@ -2131,14 +2604,18 @@ class ChatWidget(QWidget, ComponentMixin):
                     "Please try a shorter request, or split it: e.g. vase body first, "
                     "then details — and press Send again.",
                 )
-                self.status.setText("Reply truncated (max_tokens). Try again / split request.")
+                self.status.setText(
+                    "Reply truncated (max_tokens). Try again / split request."
+                )
             else:
                 self._append(
                     "System",
-                    "The model returned no text. Press Send again to retry."
-                    if not streamed_thinking else
-                    "Reasoning shown above, but no reply text followed. "
-                    "Press Send again to retry.",
+                    (
+                        "The model returned no text. Press Send again to retry."
+                        if not streamed_thinking
+                        else "Reasoning shown above, but no reply text followed. "
+                        "Press Send again to retry."
+                    ),
                 )
                 self.status.setText("Empty reply — retry.")
             self._set_busy(False)
@@ -2162,10 +2639,16 @@ class ChatWidget(QWidget, ComponentMixin):
                 self.last_code = code
                 self.apply_btn.setEnabled(True)
                 if self.plan_mode:
-                    self._append("System", "Plan ready — review the code, then press “Insert code + Render”.")
-                elif self.preferences["Auto-apply code"]:
-                    self._append("System", "Code applied to the editor and rendered.")
+                    self._append(
+                        "System",
+                        "Plan ready — review the code, then press “Insert code + Render”.",
+                    )
+                elif self.preferences["Auto-apply code"] and not tool_calls:
                     self._auto_apply_verdict = self.apply_code(code)
+                    if not self._auto_apply_verdict.startswith("OK"):
+                        self._append("Tool result", self._auto_apply_verdict[:2000])
+                    else:
+                        self._request_rendered = True
                 else:
                     self._append("System", "Code ready — press “Insert code + Render”.")
         if not tool_calls:
@@ -2174,25 +2657,65 @@ class ChatWidget(QWidget, ComponentMixin):
             # still sends a screenshot so the model can self-correct.
             verdict = getattr(self, "_auto_apply_verdict", "")
             self._auto_apply_verdict = ""
-            if (verdict and isinstance(verdict, str) and verdict.startswith("OK")
-                    and self._vision_enabled()
-                    and self.autofix.isChecked() and self.iters_left > 0):
-                capture = self._capture_screenshot()
-                if isinstance(capture, bytes):
-                    self.messages.append({
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": (
-                                "Auto-applied render OK. Screenshot of the current "
-                                "3D view is attached. Inspect it against the request "
-                                "and reply with fixed code if it looks wrong, "
-                                "otherwise confirm it looks correct."
-                            )},
-                            self._screenshot_image_block(capture),
-                        ],
-                    })
+            if verdict and not verdict.startswith("OK"):
+                if self.autofix.isChecked() and not self._finalizing:
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "The script failed validation or rendering. Repair it and return ONE complete "
+                                "```python script preserving the design requirements. Error:\n"
+                                + verdict
+                            ),
+                        }
+                    )
+                    self.iters_left -= 1
+                    self._continue_tool_loop()
+                else:
+                    reason = (
+                        "Automatic repair is off."
+                        if not self.autofix.isChecked()
+                        else "The final attempt failed."
+                    )
+                    disposition = (
+                        "Model displayed for review."
+                        if "model displayed for review"
+                        in verdict.splitlines()[0].lower()
+                        else "Code was not applied."
+                    )
+                    self._set_busy(
+                        False, f"{reason} {disposition} Last error: {verdict[:240]}"
+                    )
+                return
+            if (
+                verdict
+                and isinstance(verdict, str)
+                and verdict.startswith("OK")
+                and self._vision_enabled()
+                and self.autofix.isChecked()
+                and not self._finalizing
+            ):
+                views = self._capture_design_views()
+                if views:
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "Auto-applied render OK. Screenshot of the current "
+                                        "3D view is attached. Inspect it against the request "
+                                        "and reply with fixed code if it looks wrong, "
+                                        "otherwise confirm it looks correct."
+                                    ),
+                                },
+                                *self._view_blocks(views),
+                            ],
+                        }
+                    )
                     try:
-                        thumb = base64.b64encode(capture).decode("ascii")
+                        thumb = base64.b64encode(views[0][1]).decode("ascii")
                         self._append(
                             "System",
                             "Screenshot sent to the model for visual check.",
@@ -2202,39 +2725,67 @@ class ChatWidget(QWidget, ComponentMixin):
                         pass
                     self.iters_left -= 1
                     self._update_meter()
-                    self._kick_llm()
+                    self._continue_tool_loop()
                     return
-            if self.last_code:
-                self.status.setText("Code ready. Check editor + 3D view.")
+            if self._request_rendered:
+                message = "Model rendered."
+            elif self._finalizing:
+                message = "No model was rendered. Review the final response or try a simpler request."
+            elif self.last_code:
+                message = "Code ready. Use Insert + render to display it."
             else:
-                self.status.setText("Ready.")
-            self._set_busy(False)
+                message = "Ready."
+            self._set_busy(False, message)
             return
         if self.iters_left <= 0:
             self._append("System", "Max iterations reached.")
             self._set_busy(False)
             return
-        single_shot = not self.autofix.isChecked()
         results = []
+        failures = []
         for block in tool_calls:
             self._turn_steps += 1
             arg = self._tool_arg_preview(block.name, dict(block.input or {}))
             out = self.execute_tool(block.name, dict(block.input or {}))
+            failed = self._tool_failed(out)
+            if failed:
+                failures.append(f"{block.name}: {out[:300]}")
+            if (
+                block.name == "apply_and_render"
+                and out.startswith("OK")
+                and not self.plan_mode
+            ):
+                self._request_rendered = True
+                if (
+                    self.preferences["Learn reusable CAD skills"]
+                    and self.iters_left >= 3
+                ):
+                    out += (
+                        "\nOptional learning: if this completed design contains a useful method "
+                        "not covered by existing skills, save it with skill_manage(action='save_draft', ...). "
+                        "Then activate the draft only through skill_manage(action='activate', ...), "
+                        "which validates its example. Avoid duplicates and finish with a concise design summary."
+                    )
             content = out
             # Visual feedback: after a successful render, attach a 3D
             # screenshot so the model sees its own design and can iterate.
-            if (block.name == "apply_and_render"
-                    and isinstance(out, str) and out.startswith("OK")
-                    and self._vision_enabled()):
-                capture = self._capture_screenshot()
-                if isinstance(capture, bytes):
+            if (
+                block.name == "apply_and_render"
+                and isinstance(out, str)
+                and out.startswith("OK")
+                and self._vision_enabled()
+            ):
+                views = self._capture_design_views()
+                if views:
                     verdict = (
                         out + "\nScreenshot of the current 3D view is attached. "
                         "Inspect it against the request and iterate if needed."
                     )
-                    content = self._tool_result_with_screenshot(verdict, capture)
+                    content = [{"type": "text", "text": verdict}] + self._view_blocks(
+                        views
+                    )
                     try:
-                        thumb = base64.b64encode(capture).decode("ascii")
+                        thumb = base64.b64encode(views[0][1]).decode("ascii")
                         self._append(
                             "System",
                             "Screenshot sent to the model for visual check.",
@@ -2244,33 +2795,43 @@ class ChatWidget(QWidget, ComponentMixin):
                         pass
                 else:
                     # Screenshot failed: keep text-only so the loop continues.
-                    content = out + f"\n(Screenshot unavailable: {capture})"
+                    content = (
+                        out
+                        + "\n(Visual verification: Not checked; view capture unavailable.)"
+                    )
             results.append(
-                {"type": "tool_result", "tool_use_id": block.id, "content": content}
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": content,
+                    "is_error": failed,
+                }
             )
             first_line = (out.strip().splitlines() or [""])[0][:160]
-            if out.startswith("OK"):
-                self._append_step(f"[{self._turn_steps}] {block.name} {arg} → {first_line}", ok=True)
+            if not failed:
+                self._append_step(
+                    f"[{self._turn_steps}] {block.name} {arg} → {first_line}", ok=True
+                )
             else:
-                self._append_step(f"[{self._turn_steps}] {block.name} {arg} → needs fix", ok=False)
+                self._append_step(
+                    f"[{self._turn_steps}] {block.name} {arg} → needs fix", ok=False
+                )
                 self._append("Tool result", out[:2000])
         self._update_meter()
         self.messages.append({"role": "user", "content": results})
         self.iters_left -= 1
-        if single_shot or self.iters_left <= 0:
-            self._append("System", "Tools executed (self-fix off or limit reached).")
-            self._set_busy(False)
+        if failures and not self.autofix.isChecked():
+            message = "Automatic repair is off. Last tool error: " + failures[-1]
+            self._append("System", message)
+            self._set_busy(False, message)
             return
-        self._kick_llm()
+        self._continue_tool_loop()
 
     @pyqtSlot(str)
     def on_llm_err(self, msg):
-        if self.worker:
-            try:
-                self.worker.deleteLater()
-            except Exception:
-                pass
-            self.worker = None
+        if isinstance(self.sender(), LLMWorker) and self.sender() is not self.worker:
+            return
+        self.worker = None
         self._finish_stream_display()
         self._stream_buf = ""
         self._think_buf = ""
@@ -2287,8 +2848,7 @@ class ChatWidget(QWidget, ComponentMixin):
                 "(e.g. FIREWORKS_MODEL_ID=accounts/fireworks/models/kimi-k3), "
                 "restart the app, re-enable Vision, and send the image again.",
             )
-        self.status.setText(msg)
-        self._set_busy(False)
+        self._set_busy(False, msg)
 
     # ------------- CAD tools (GUI thread only) -------------
     def _clear_board(self):
@@ -2324,10 +2884,22 @@ class ChatWidget(QWidget, ComponentMixin):
             def _cap(exc_info, script):
                 captured["exc"] = exc_info
 
-            # render() emits sigTraceback synchronously in this thread.
+            # Reuse the completed child build; never execute AI code again in Qt.
             dbg.sigTraceback.connect(_cap)
             try:
-                dbg.render()
+                cached = self._validated_job
+                if (
+                    cached is None
+                    or cached[0] != code
+                    or cached[1] != self.design_requirements
+                ):
+                    verdict = self._validate_isolated(code)
+                    if not verdict.startswith("OK"):
+                        return False, verdict
+                    cached = self._validated_job
+                if self._stop_requested:
+                    return False, "Cancelled: no code was applied."
+                dbg.display_job(cached[2], code)
             finally:
                 dbg.sigTraceback.disconnect(_cap)
             exc = captured.get("exc")
@@ -2379,6 +2951,14 @@ class ChatWidget(QWidget, ComponentMixin):
         Returns a short status string for the chat.
         """
         code = (self.session_design or "").strip()
+        self._stop_requested = False
+        self._validated_job = None
+        self.verification.invalidate()
+        if self.session_id:
+            _, meta = self._store.load_session(self.session_id)
+            self._set_requirements((meta or {}).get("requirements", []))
+        else:
+            self._set_requirements([])
         self._clear_board()
         if not code:
             self._reset_editor_to_empty()
@@ -2419,17 +2999,20 @@ class ChatWidget(QWidget, ComponentMixin):
         return None
 
     def _validate_isolated(self, code):
-        """Crash-safe validation: child process, never in-process.
-
-        Falls back to in-process headless_validate only when the probe
-        itself cannot run (Error:) or the user disabled pre-render.
-        """
-        try:
-            enabled = bool(self.preferences["Isolated pre-render"])
-        except Exception:
-            enabled = True
-        if not enabled:
-            return headless_validate(code)
+        """Cancellable child build; successful geometry is cached for display."""
+        if self._stop_requested:
+            return "Error: Cancelled: CAD job stopped."
+        if (
+            self._validated_job is not None
+            and self._validated_job[0] == code
+            and self._validated_job[1] == self.design_requirements
+        ):
+            result = self._validated_job[2]
+            self._show_verification(result["report"], code=code)
+            return (
+                f"OK: reused the validated build, {len(result['objects'])} object(s).\n"
+                + report_text(result["report"])
+            )
         try:
             timeout = int(self.preferences["Pre-render timeout (s)"])
         except Exception:
@@ -2438,16 +3021,189 @@ class ChatWidget(QWidget, ComponentMixin):
             self.status.setText("Validating geometry in an isolated process…")
         except Exception:
             pass
-        verdict = isolated_validate(code, timeout=timeout,
-                                    workdir=self._probe_workdir())
-        if verdict.startswith("Error: isolated probe could not run"):
-            return headless_validate(code)
+        result = self._run_cad(
+            dict(
+                code=code,
+                requirements=self.design_requirements,
+                workdir=self._probe_workdir(),
+            ),
+            timeout=timeout,
+        )
+        if not result.get("ok"):
+            self._validated_job = None
+            error = result.get("error", "CAD build failed")
+            if result.get("traceback"):
+                from ..ai.cad_agent import validation_failure
+
+                return validation_failure(
+                    code,
+                    result["traceback"],
+                    result.get("line"),
+                    error,
+                    result.get("version", ""),
+                )
+            return (
+                error
+                if error.startswith(("CRASH:", "TIMEOUT:", "Error:"))
+                else "Error: " + error
+            )
+        self._validated_job = (code, list(self.design_requirements), result)
+        self._show_verification(result["report"], code=code)
+        return (
+            f"OK: isolated build created {len(result['objects'])} object(s).\n"
+            + report_text(result["report"])
+        )
+
+    def _run_cad(self, request, timeout=180, shapes=None):
+        from .cad_job import run_cad_job
+
+        if self._operation_active:
+            return {"ok": False, "error": "Error: another CAD operation is running."}
+        self._operation_active = True
+        self._set_busy(True, "Building and verifying geometry")
+        try:
+            return run_cad_job(
+                request,
+                owner=self,
+                timeout=timeout,
+                cancelled=lambda: self._stop_requested,
+                shapes=shapes,
+            )
+        except Exception as error:
+            return {
+                "ok": False,
+                "error": f"Error: CAD operation could not run: {type(error).__name__}: {error}",
+            }
+        finally:
+            self._operation_active = False
+            # The parent AI turn keeps its controls locked between tools.
+            if self.iters_left <= 0 or self._stop_requested:
+                self._set_busy(
+                    False,
+                    "Stopped." if self._stop_requested else "CAD operation finished.",
+                )
+
+    def _set_requirements(self, requirements):
+        self.design_requirements = normalize_requirements(requirements)
+        self._validated_job = None
+        self.verification_report = None
+        self._verification_code = None
+        self._visual_capture_revision = None
+        self.verification.set_requirements(self.design_requirements)
+
+    def _show_verification(self, report, code=None):
+        self.verification_report = report
+        self._verification_code = (
+            self._editor_text() if code is None else code
+        ).replace("\r\n", "\n")
+        self.verification.set_report(report)
+
+    def _on_editor_changed(self):
+        current_code = self._editor_text().replace("\r\n", "\n")
+        if (
+            self._verification_code is not None
+            and self._verification_code == current_code
+        ):
+            return  # syntax highlighting and theme updates can emit textChanged
+        self.verification_report = None
+        self._verification_code = None
+        self._visual_capture_revision = None
+        self.verification.invalidate()
+        if (
+            self._validated_job is not None
+            and self._validated_job[0].replace("\r\n", "\n") != current_code
+        ):
+            self._validated_job = None
+
+    def verify_design(self):
+        code = self._editor_text()
+        if not code.strip():
+            return "Error: no design code to verify."
+        verdict = self._validate_isolated(code)
+        if (
+            verdict.startswith("OK")
+            and self.verification_report
+            and not self.verification_report["ok"]
+        ):
+            return "Error: design verification failed.\n" + report_text(
+                self.verification_report
+            )
         return verdict
+
+    @pyqtSlot()
+    def on_verify_design(self):
+        if self.worker is not None or self._operation_active:
+            return
+        self._stop_requested = False
+        output = self.verify_design()
+        self._append("Verification", output)
+        self._set_busy(
+            False, "Verification finished. Review Passed / Failed / Not checked."
+        )
 
     def execute_tool(self, name, args):
         try:
+            if self._stop_requested:
+                return "Error: Cancelled: no further tools were executed."
+            from ..ai.recovery import cad_argument_error
+
+            argument_error = cad_argument_error(name, args)
+            if argument_error:
+                return "Error: " + argument_error
             if name == "get_editor_code":
                 return self.get_editor_code()
+            if name == "set_design_requirements":
+                requirements = normalize_requirements(args.get("requirements", []))
+                if (
+                    self._requirements_recorded_this_turn
+                    and requirements != self.design_requirements
+                ):
+                    return "Error: requirements are fixed for this request. Repair the geometry without weakening the checks. The user can edit Checks or send updated requirements."
+                self._set_requirements(requirements)
+                self._requirements_recorded_this_turn = True
+                return (
+                    "OK: requirements recorded for independent geometry measurements.\n"
+                    + str(self.design_requirements)
+                )
+            if name == "verify_design":
+                return self.verify_design()
+            if name == "record_visual_review":
+                if (
+                    self._visual_capture_revision != self._editor_text()
+                    or self.verification_report is None
+                ):
+                    return "Error: capture current design views before recording a visual review."
+                status, notes = args.get("status"), args.get("notes", "")
+                if (
+                    status not in ("Passed", "Failed", "Not checked")
+                    or not isinstance(notes, str)
+                    or not notes.strip()
+                ):
+                    return "Error: provide a review status and notes about the inspected views."
+                from ..ai.verification import row
+
+                self.verification_report["rows"] = [
+                    r
+                    for r in self.verification_report["rows"]
+                    if r["label"] != "AI visual review"
+                ]
+                self.verification_report["rows"].append(
+                    row(
+                        "AI visual review",
+                        status,
+                        detail=notes[:4000]
+                        + " This is the AI's visual assessment, not a measured geometry check.",
+                    )
+                )
+                self.verification_report["ok"] = not any(
+                    r["status"] == "Failed" for r in self.verification_report["rows"]
+                )
+                self.verification.set_report(self.verification_report)
+                return (
+                    "Error: visual review found discrepancies. "
+                    if status == "Failed"
+                    else "OK: visual review recorded. "
+                ) + notes[:4000]
             if name == "validate_cad_code":
                 # Crash-safe: runs in a child process (a native OCCT
                 # segfault on complex geometry must not kill the app).
@@ -2464,7 +3220,25 @@ class ChatWidget(QWidget, ComponentMixin):
                 self.apply_btn.setEnabled(True)
                 return self.apply_code(code)
             if name == "get_examples":
-                return self.get_examples()
+                return self.get_examples(args.get("name", ""))
+            if name == "skill_view":
+                return self._skills.view(
+                    args.get("name", ""),
+                    args.get("file"),
+                    draft=bool(args.get("draft", False)),
+                )
+            if name == "skill_manage":
+                if self.plan_mode or not self.preferences["Learn reusable CAD skills"]:
+                    return "Error: skill learning is disabled in Plan mode or Preferences. Existing skills can still be read."
+                if self._skills.validator is None:
+                    self._skills.validator = self._validate_skill
+                return self._skills.manage(
+                    args.get("action", ""),
+                    args.get("name", ""),
+                    args.get("description", ""),
+                    args.get("instructions", ""),
+                    args.get("example_code", ""),
+                )
             if name == "export_model":
                 return self.export_model(
                     args.get("format", "stl"), args.get("filename", "")
@@ -2474,6 +3248,22 @@ class ChatWidget(QWidget, ComponentMixin):
             return f"Error: unknown tool {name}"
         except Exception:
             return "Error:\n" + tb.format_exc(limit=5)
+
+    def _validate_skill(self, code):
+        result = self._run_cad(
+            dict(
+                code=code,
+                requirements=[],
+                assembly=False,
+                workdir=self._probe_workdir(),
+            ),
+            timeout=int(self.preferences["Pre-render timeout (s)"]),
+        )
+        return (
+            "OK: skill example produced valid geometry."
+            if result.get("ok")
+            else "Error: " + result.get("error", "Skill validation failed")
+        )
 
     def _capture_screenshot(self):
         """Capture the current 3D viewer image as JPEG bytes.
@@ -2492,6 +3282,7 @@ class ChatWidget(QWidget, ComponentMixin):
             if view is None:
                 return "Error: 3D view is not initialized."
             import tempfile
+
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                 tmp_path = tmp.name
             try:
@@ -2504,6 +3295,7 @@ class ChatWidget(QWidget, ComponentMixin):
                         1024, 1024, Qt.KeepAspectRatio, Qt.SmoothTransformation
                     )
                 from PyQt5.QtCore import QBuffer, QIODevice
+
                 buf = QBuffer()
                 buf.open(QIODevice.WriteOnly)
                 if not img.save(buf, "JPEG", 80):
@@ -2512,6 +3304,7 @@ class ChatWidget(QWidget, ComponentMixin):
             finally:
                 try:
                     import os
+
                     os.unlink(tmp_path)
                 except Exception:
                     pass
@@ -2524,6 +3317,83 @@ class ChatWidget(QWidget, ComponentMixin):
             return bool(self.vision_check.isChecked())
         except Exception:
             return True
+
+    def _capture_design_views(self):
+        """Capture labelled views and restore the user's exact camera."""
+        from OCP.Graphic3d import Graphic3d_Camera
+        from OCP.V3d import V3d_XposYnegZpos, V3d_Yneg, V3d_Zpos, V3d_Xpos
+
+        views = []
+        view = None
+        camera = None
+        try:
+            main = self._main()
+            if main is None:
+                return []
+            viewer = main.components["viewer"]
+            view = viewer._get_view()
+            if view is None:
+                return []
+            camera = Graphic3d_Camera(view.Camera())
+            for label, orientation in [
+                ("Isometric", V3d_XposYnegZpos),
+                ("Front", V3d_Yneg),
+                ("Top", V3d_Zpos),
+                ("Side", V3d_Xpos),
+            ]:
+                if self._stop_requested:
+                    break
+                view.SetProj(orientation)
+                # The app's fit excludes axis helpers, which otherwise make
+                # small parts occupy only a tiny fraction of the image.
+                if hasattr(viewer, "fit"):
+                    viewer.fit()
+                else:
+                    view.FitAll()
+                view.Redraw()
+                capture = self._capture_screenshot()
+                if isinstance(capture, bytes):
+                    views.append((label, capture))
+        except Exception:
+            pass
+        finally:
+            if view is not None and camera is not None:
+                view.Camera().Copy(camera)
+                view.Redraw()
+        if not views:
+            capture = self._capture_screenshot()
+            if isinstance(capture, bytes):
+                views.append(("Current view", capture))
+        if self.verification_report is not None:
+            from ..ai.verification import row
+
+            self._visual_capture_revision = self._editor_text() if views else None
+            self.verification_report["rows"] = [
+                r
+                for r in self.verification_report["rows"]
+                if r["label"] != "AI visual review"
+            ]
+            self.verification_report["rows"].append(
+                row(
+                    "AI visual review",
+                    "Not checked",
+                    detail=(
+                        ", ".join(label for label, _ in views)
+                        + " captured for AI review; capture alone does not certify visual correctness."
+                        if views
+                        else "No screenshots could be captured."
+                    ),
+                )
+            )
+            self.verification.set_report(self.verification_report)
+        return views
+
+    def _view_blocks(self, views):
+        blocks = []
+        for label, jpeg in views:
+            blocks.append({"type": "text", "text": label + " view"})
+            blocks.append(self._screenshot_image_block(jpeg))
+        return blocks
 
     @staticmethod
     def _screenshot_image_block(jpeg_bytes):
@@ -2564,7 +3434,19 @@ class ChatWidget(QWidget, ComponentMixin):
             finished_ok = pyqtSignal(object)
             finished_err = pyqtSignal(str)
 
-            def __init__(self, parent, purpose, task, messages, model, effort, client, image_bytes=None):
+            def __init__(
+                self,
+                parent,
+                purpose,
+                task,
+                messages,
+                model,
+                effort,
+                client,
+                image_bytes=None,
+                current_code="",
+                skills=None,
+            ):
                 super().__init__(parent)
                 self.purpose = purpose
                 self.task = task
@@ -2573,22 +3455,21 @@ class ChatWidget(QWidget, ComponentMixin):
                 self.effort = effort
                 self.client = client
                 self.image_bytes = image_bytes
+                self.current_code = current_code
+                self.skills = skills
 
             def run(self):
                 try:
                     if self.purpose == "code":
-                        current = ""
-                        try:
-                            current = self.parent()._editor_text()
-                        except Exception:
-                            pass
                         result = run_code_subagent(
                             request=self.task,
-                            current_code=current,
+                            current_code=self.current_code,
                             parent_messages=self.messages,
                             model=self.model,
                             effort=self.effort,
                             client=self.client,
+                            skills=self.skills,
+                            cancelled=self.isInterruptionRequested,
                         )
                     else:
                         result = run_subagent(
@@ -2598,6 +3479,8 @@ class ChatWidget(QWidget, ComponentMixin):
                             effort=self.effort,
                             image_bytes=self.image_bytes,
                             client=self.client,
+                            skills=self.skills,
+                            cancelled=self.isInterruptionRequested,
                         )
                     self.finished_ok.emit(result)
                 except Exception as e:
@@ -2620,33 +3503,75 @@ class ChatWidget(QWidget, ComponentMixin):
 
         self._set_busy(True, "Running subagent")
         worker = SubagentWorker(
-            self, purpose, task, list(self.messages),
-            getattr(self, "_model", None), self.effort, getattr(self, "_client", None),
+            self,
+            purpose,
+            task,
+            list(self.messages),
+            getattr(self, "_model", None),
+            self.effort,
+            getattr(self, "_client", None),
             image_bytes=image_bytes,
+            current_code=self._editor_text(),
+            skills=self._skills,
         )
         result_holder = {"value": None}
+        from PyQt5.QtCore import QEventLoop
+
+        loop = QEventLoop()
 
         def on_ok(res):
             result_holder["value"] = res
-            self.quit_loop = True
+            loop.quit()
 
         def on_err(msg):
-            result_holder["value"] = {"ok": False, "text": msg, "usage": {"in": 0, "out": 0}}
-            self.quit_loop = True
+            result_holder["value"] = {
+                "ok": False,
+                "text": msg,
+                "usage": {"in": 0, "out": 0},
+            }
+            loop.quit()
 
         worker.finished_ok.connect(on_ok)
         worker.finished_err.connect(on_err)
+        self._retain_worker(worker)
+        self._operation_active = True
         worker.start()
+        timer = QTimer()
+        timer.setInterval(50)
 
-        # Small event-loop spin so the UI stays responsive while we wait.
-        # This is called from the GUI thread during a tool call.
-        self.quit_loop = False
-        while not self.quit_loop:
-            QApplication.processEvents()
-            QThread.msleep(20)
-        worker.wait(5000)
+        def cancel():
+            if self._stop_requested:
+                worker.requestInterruption()
+                loop.quit()
 
-        result = result_holder["value"] or {"ok": False, "text": "No result", "usage": {"in": 0, "out": 0}}
+        timer.timeout.connect(cancel)
+        timer.start()
+        deadline = QTimer()
+        deadline.setSingleShot(True)
+
+        def timed_out():
+            worker.requestInterruption()
+            result_holder["value"] = {
+                "ok": False,
+                "text": "Subagent exceeded its 240s time budget.",
+                "usage": {},
+            }
+            loop.quit()
+
+        deadline.timeout.connect(timed_out)
+        deadline.start(240000)
+        loop.exec_()
+        timer.stop()
+        deadline.stop()
+        self._operation_active = False
+        if self._stop_requested:
+            return "Error: subagent cancelled."
+
+        result = result_holder["value"] or {
+            "ok": False,
+            "text": "No result",
+            "usage": {"in": 0, "out": 0},
+        }
         usage = result.get("usage") or {"in": 0, "out": 0}
         self.sess_usage["in"] += int(usage.get("in", 0))
         self.sess_usage["out"] += int(usage.get("out", 0))
@@ -2678,14 +3603,13 @@ class ChatWidget(QWidget, ComponentMixin):
         except Exception as e:
             return f"Error reading editor: {e}"
 
-    def get_examples(self):
+    def get_examples(self, name=""):
         try:
+            from ..ai.cad_agent import read_example
+
             main = self._main()
-            if main is None:
-                return "Error: main window not found."
-            ex_dir = main._examples_dir()
-            names = sorted(p.stem for p in Path(ex_dir).glob("*.py"))
-            return "Examples: " + ", ".join(names) if names else "No examples found."
+            ex_dir = main._examples_dir() if main is not None else None
+            return read_example(name, ex_dir)
         except Exception as e:
             return f"Error listing examples: {e}"
 
@@ -2695,18 +3619,16 @@ class ChatWidget(QWidget, ComponentMixin):
         Pushes the previous editor text as an undo checkpoint first.
         On success the code becomes this session's design (restored on switch).
 
-        Crash-safe: a CRASH/TIMEOUT verdict from the isolated probe refuses
-        the render (rendering it in-process would kill the app). Python-level
-        tracebacks still go through the normal render path so they can be
-        captured and fed back to the model.
+        Validation must succeed before the editor or viewer is changed.
+        Failures are returned to the generation loop so it can repair the code.
         """
-        if not code:
+        if not isinstance(code, str) or not code.strip():
             return "Error: empty code"
         probe = self._validate_isolated(code)
-        if probe.startswith(("CRASH:", "TIMEOUT:")):
+        if not probe.startswith("OK"):
             self._append("Error", probe)
             try:
-                self.status.setText("Render refused: isolated probe crashed.")
+                self.status.setText("Validation failed; code was not applied.")
             except Exception:
                 pass
             return probe
@@ -2728,20 +3650,33 @@ class ChatWidget(QWidget, ComponentMixin):
                 self.session_design = code
                 self._save_session()
                 self._append_success_card(code)
-                return "OK: code applied and rendered, no traceback." + suffix
+                report = self.verification_report
+                if report and not report.get("ok"):
+                    return (
+                        "Error: design verification failed; model displayed for review. Repair failed checks without changing their expected values.\n"
+                        + report_text(report)
+                    )
+                return (
+                    "OK: code applied and rendered, no traceback."
+                    + suffix
+                    + ("\n" + report_text(report) if report else "")
+                )
             return "Rendered WITH traceback:\n" + msg
         except Exception:
             return "Error applying code:\n" + tb.format_exc(limit=5)
 
     def _append_success_card(self, code):
         """Show a green status card when the model renders successfully."""
-        dark = self._app_is_dark()
-        bg = "#064e3b" if dark else "#dcfce7"
-        fg = "#d1fae5" if dark else "#14532d"
-        border = "#10b981" if dark else "#86efac"
+        colors = theme_for(self._app_is_dark())
+        bg, fg, border = colors.selection, colors.accent, colors.border
         lines = len(code.splitlines())
         chars = len(code)
         stamp = self._now()
+        title = (
+            "Model rendered; checks need review."
+            if self.verification_report and not self.verification_report.get("ok")
+            else "Model created successfully!"
+        )
         card = (
             f"<div style='margin:8px 2px 12px;'>"
             f"<table width='100%' cellspacing='0' cellpadding='0'><tr><td align='center'>"
@@ -2749,7 +3684,7 @@ class ChatWidget(QWidget, ComponentMixin):
             f"style='background:{bg};border:1px solid {border};border-radius:12px;'>"
             f"<tr><td>"
             f"<div style='font-size:14px;font-weight:800;color:{fg};margin-bottom:4px;'>"
-            f"Model created successfully!</div>"
+            f"{title}</div>"
             f"<div style='font-size:12px;color:{fg};line-height:1.45;'>"
             f"Your build123d model was generated and rendered in the 3D view. "
             f"({lines} lines, {chars} chars) · {stamp}"
@@ -2759,9 +3694,11 @@ class ChatWidget(QWidget, ComponentMixin):
 
     @pyqtSlot()
     def on_apply_last(self):
-        if self.last_code:
+        if self.last_code and not self._operation_active and self.worker is None:
+            self._stop_requested = False
             out = self.apply_code(self.last_code)
             self._append("System", out)
+            self._set_busy(False, out.splitlines()[0])
 
     # ------------- export -------------
     def _collect_shapes(self):
@@ -2783,28 +3720,65 @@ class ChatWidget(QWidget, ComponentMixin):
             _walk(cq_root)
         return shapes
 
-    def export_model(self, fmt="stl", filename=""):
+    def export_model(self, fmt="stl", filename="", shapes=None, precision=None):
         """Agent-callable export. Defaults to exports/model.<ext> in cwd."""
         fmt = (fmt or "stl").lower().lstrip(".")
         if fmt not in ("stl", "step", "brep"):
             return f"Error: unsupported format '{fmt}'. Use stl/step/brep."
         try:
-            shapes = self._collect_shapes()
+            shapes = self._collect_shapes() if shapes is None else shapes
             if not shapes:
                 return "Error: no models to export. Render code first."
             if not filename:
                 out_dir = Path.cwd() / "exports"
                 out_dir.mkdir(parents=True, exist_ok=True)
                 filename = str(out_dir / f"model.{fmt}")
-            from ..cq_utils import export as b3d_export
-
-            b3d_export(shapes, fmt, filename)
-            return f"OK: exported {len(shapes)} object(s) to {filename}"
+            result = self._run_cad(
+                dict(
+                    requirements=[],
+                    assembly=False,
+                    export={
+                        "format": fmt,
+                        "filename": str(Path(filename).resolve()),
+                        "precision": 0.1 if precision is None else float(precision),
+                    },
+                ),
+                timeout=int(self.preferences["Pre-render timeout (s)"]),
+                shapes={f"object{i + 1}": shape for i, shape in enumerate(shapes)},
+            )
+            if not result.get("ok"):
+                return "Error exporting: " + result.get("error", "CAD export failed")
+            report = result["report"]
+            if self.verification_report:
+                exported_rows = [
+                    r
+                    for r in report["rows"]
+                    if "export" in r["label"].lower()
+                    or "reopened" in r["label"].lower()
+                    or r["label"].startswith("STL ")
+                ]
+                report = dict(
+                    self.verification_report,
+                    rows=self.verification_report["rows"] + exported_rows,
+                )
+                report["ok"] = not any(r["status"] == "Failed" for r in report["rows"])
+            self._show_verification(report)
+            prefix = (
+                "OK:"
+                if result["report"]["ok"]
+                else "Error: export verification failed."
+            )
+            return (
+                f"{prefix} exported {len(shapes)} object(s) to {filename}\n"
+                + report_text(result["report"])
+            )
         except Exception:
             return "Error exporting:\n" + tb.format_exc(limit=5)
 
     @pyqtSlot()
     def on_export_button(self, fmt):
+        if self._operation_active or self.worker is not None:
+            return
         shapes = self._collect_shapes()
         if not shapes:
             self._append("System", "Nothing to export — render a model first.")
@@ -2813,11 +3787,10 @@ class ChatWidget(QWidget, ComponentMixin):
         if not fname:
             return
         try:
-            from ..cq_utils import export as b3d_export
-
-            b3d_export(shapes, fmt, fname)
-            self._append("System", f"Exported {len(shapes)} object(s) to {fname}")
-            self.status.setText(f"Exported to {fname}")
+            self._stop_requested = False
+            output = self.export_model(fmt, fname)
+            self._append("System", output)
+            self._set_busy(False, output.splitlines()[0])
         except Exception as e:
             self._append("Error", f"Export failed: {e}")
 
@@ -2869,8 +3842,10 @@ class ChatWidget(QWidget, ComponentMixin):
                 self.session_title = (meta or {}).get("title") or DEFAULT_TITLE
                 self.messages = messages
                 usage = (meta or {}).get("usage") or {}
-                self.sess_usage = {"in": int(usage.get("in", 0) or 0),
-                                   "out": int(usage.get("out", 0) or 0)}
+                self.sess_usage = {
+                    "in": int(usage.get("in", 0) or 0),
+                    "out": int(usage.get("out", 0) or 0),
+                }
                 self.session_design = (meta or {}).get("design_code", "") or ""
         if self.session_id is None:
             # Fresh start with no history: lazy unsaved chat, no junk file.
@@ -2885,4 +3860,3 @@ class ChatWidget(QWidget, ComponentMixin):
         note = self._restore_session_design()
         if (self.session_design or "").strip():
             self._append("System", note)
-
